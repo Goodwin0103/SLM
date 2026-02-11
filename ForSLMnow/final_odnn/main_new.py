@@ -309,6 +309,109 @@ def export_phase_masks_multiwl_per_wavelength(
         "png_dir": str(out_dir / "png") if save_png else "",
     }
 
+def save_phase_masks_grid_png(
+    phase_stack_nhw: np.ndarray,   # (N,H,W)
+    *,
+    save_path: str | Path,
+    title: str,
+    cmap: str = "hsv",
+    wrap_to_2pi: bool = True,
+    dpi: int = 300,
+):
+    """把 N 层相位 mask 画成一张拼图 PNG（每层一个子图 + colorbar）。"""
+    phase = np.asarray(phase_stack_nhw, dtype=np.float32)
+    if phase.ndim != 3:
+        raise ValueError(f"phase_stack_nhw must be (N,H,W), got {phase.shape}")
+
+    if wrap_to_2pi:
+        phase = np.remainder(phase, 2 * np.pi)
+        vmin, vmax = 0.0, 2 * np.pi
+    else:
+        vmin, vmax = None, None
+
+    N = phase.shape[0]
+    fig_w = max(10, 2.6 * N)   # 让 6 层不会太挤
+    fig, axes = plt.subplots(1, N, figsize=(fig_w, 3.0), squeeze=False)
+    axes = axes[0]
+
+    for i in range(N):
+        ax = axes[i]
+        im = ax.imshow(phase[i], cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.set_title(f"Layer {i+1}", fontsize=10)
+        ax.set_axis_off()
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("Phase (rad)", fontsize=9)
+
+    fig.suptitle(title, fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+def save_phase_masks_grid_wl_x_layer_png(
+    phase_scaled_by_lambda_lLHW: np.ndarray,  # (N_layers, L, H, W)
+    wavelengths_m: np.ndarray,                # (L,)
+    *,
+    save_path: str | Path,
+    title: str,
+    cmap: str = "hsv",
+    wrapped: bool = True,   # True 表示数据已在 [0,2pi)
+    dpi: int = 300,
+):
+    arr = np.asarray(phase_scaled_by_lambda_lLHW, dtype=np.float32)
+    if arr.ndim != 4:
+        raise ValueError(f"Expected (N_layers,L,H,W), got {arr.shape}")
+
+    N_layers, L_local, _, _ = arr.shape
+    wls = np.asarray(wavelengths_m, dtype=np.float64).reshape(-1)
+    if wls.shape[0] != L_local:
+        raise ValueError(f"wavelengths_m length {wls.shape[0]} != L {L_local}")
+
+    if wrapped:
+        vmin, vmax = 0.0, 2 * np.pi
+    else:
+        vmin, vmax = None, None
+
+    # 行=波长，列=layer；预留右侧空间放 colorbar
+    fig_w = max(10, 2.2 * N_layers) + 0.9
+    fig_h = max(3.5, 2.0 * L_local)
+    fig, axes = plt.subplots(L_local, N_layers, figsize=(fig_w, fig_h), squeeze=False)
+
+    im_ref = None
+    for li in range(L_local):
+        wl_nm = float(wls[li] * 1e9)
+        for ni in range(N_layers):
+            ax = axes[li, ni]
+            im = ax.imshow(arr[ni, li], cmap=cmap, vmin=vmin, vmax=vmax)
+            if im_ref is None:
+                im_ref = im
+            ax.set_axis_off()
+
+            if li == 0:
+                ax.set_title(f"Layer {ni+1}", fontsize=10)
+            if ni == 0:
+                ax.text(
+                    -0.06, 0.5, f"λ={wl_nm:.1f} nm",
+                    transform=ax.transAxes, rotation=90,
+                    va="center", ha="right", fontsize=10
+                )
+
+    fig.suptitle(title, fontsize=12)
+
+    # ✅ 先排版，确保子图占满；再在右侧“额外加一个轴”放 colorbar
+    fig.tight_layout(rect=(0, 0, 0.92, 0.95))   # 右侧保留 8% 宽度给 colorbar
+    cax = fig.add_axes([0.94, 0.18, 0.015, 0.64])  # [left, bottom, width, height] in figure coords
+    cbar = fig.colorbar(im_ref, cax=cax)
+    cbar.set_label("Phase (rad)", fontsize=10)
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
 def build_mode_context(base_modes: np.ndarray, num_modes: int) -> dict:
     if base_modes.shape[2] < num_modes:
         raise ValueError(
@@ -879,18 +982,56 @@ for num_layer in num_layer_option:
     save_path = os.path.join(ckpt_dir, f"odnn_multiwl_{int(num_layer)}layers_m{num_modes}_ls{layer_size}.pth")
     torch.save(ckpt, save_path)
     print("✔ Saved model ->", save_path)
+
     # ----------------------------
-    # Export phase masks (phi0 + scaled-by-lambda)
+    # Export phase masks (one-shot) + grids (phi0 grid + wavelength×layer grid)
     # ----------------------------
     phase_dir = Path("results/phase_masks_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    export_phase_masks_multiwl_per_wavelength(
+    phase_dir.mkdir(parents=True, exist_ok=True)
+
+    tag = f"multiwl_L{num_layer}_m{num_modes}_ls{layer_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    # 1) 一次性导出：phi0、scaled-by-lambda、以及可视化 wrap 的 *_vis
+    export_info = export_phase_masks_multiwl_per_wavelength(
         model,
         out_dir=phase_dir,
-        tag=f"multiwl_L{num_layer}_m{num_modes}_ls{layer_size}",
+        tag=tag,
         wavelengths=wavelengths,
         save_png=export_phase_png,
         wrap_to_2pi=phase_png_wrap_2pi,
+        dpi=300,
+        cmap="twilight",
     )
+
+    # 2) 直接从导出的 npz 读数据来画拼图（避免重复从 model.layers 再抽一次）
+    data = np.load(export_info["npz_path"])
+    phase_phi0_vis = data["phase_phi0_vis"]                       # (N_layers,H,W) 已 wrap 到 0..2pi
+    phase_scaled_vis = data["phase_scaled_by_lambda_vis"]         # (N_layers,L,H,W) 已 wrap 到 0..2pi
+    wls_m = data["wavelengths_m"]                                 # (L,)
+
+    # 2a) 画：按层排列（phi0）
+    save_phase_masks_grid_png(
+        phase_phi0_vis,
+        save_path=phase_dir / f"grid_phi0_layers{num_layer}_{tag}.png",
+        title=f"Phase Masks (phi0) - {num_layer} Layers",
+        cmap="hsv",
+        wrap_to_2pi=False,   # 因为已经是 *_vis（0..2pi），不要重复 wrap
+        dpi=300,
+    )
+
+    # 2b) 画：行=波长、列=层（scaled-by-lambda）
+    save_phase_masks_grid_wl_x_layer_png(
+        phase_scaled_vis,
+        wls_m,
+        save_path=phase_dir / f"grid_wavelength_x_layer_layers{num_layer}_{tag}.png",
+        title=f"Phase Masks - {num_layer} Layers (rows=λ, cols=layer)",
+        cmap="hsv",
+        wrapped=True,        # *_vis 已经是 0..2pi
+        dpi=300,
+    )
+
+    print(f"✔ Phase export + grids saved -> {phase_dir}")
+
 
 
 
