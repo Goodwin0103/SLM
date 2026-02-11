@@ -1252,3 +1252,81 @@ def export_superposition_slices(
         )
         np.savez(model_dir / "camera_field_superposition.npz", camera_field=camera_field)
         print(f"Superposition slices saved -> {model_dir.resolve()}")
+
+# =========================
+# Multi-wavelength additions
+# =========================
+
+from typing import Dict, Any, List  # noqa: E402
+
+
+def _make_kz_stack_multiwl(N: int, dx: float, wavelengths: np.ndarray, device: torch.device) -> torch.Tensor:
+    """
+    kz: (L, N, N) complex64
+    """
+    wl = torch.tensor(wavelengths, dtype=torch.float32, device=device)  # (L,)
+    fx = torch.fft.fftshift(torch.fft.fftfreq(N, d=dx)).to(device)
+    fxx, fyy = torch.meshgrid(fx, fx, indexing="ij")  # (N,N)
+
+    inv_lam2 = (1.0 / wl)[:, None, None] ** 2
+    argument = (2 * torch.pi) ** 2 * (inv_lam2 - fxx[None] ** 2 - fyy[None] ** 2)
+
+    tmp = torch.sqrt(torch.abs(argument))
+    kz = torch.where(argument >= 0, tmp, 1j * tmp).to(torch.complex64)
+    return kz
+
+
+def _propagate_multiwl_kz(E_blhw: torch.Tensor, kz_lnn: torch.Tensor, z: float) -> torch.Tensor:
+    """
+    E_blhw: (B,L,N,N) complex
+    kz_lnn: (L,N,N) complex
+    """
+    E_blhw = E_blhw.to(torch.complex64)
+    C = torch.fft.fftshift(torch.fft.fft2(E_blhw), dim=(-2, -1))
+    return torch.fft.ifft2(torch.fft.ifftshift(C * torch.exp(1j * kz_lnn[None] * float(z)), dim=(-2, -1)))
+
+
+def _complex_pad_blhw(E_blhw: torch.Tensor, pad_px: int) -> torch.Tensor:
+    """
+    pad complex tensor (B,L,H,W) with zeros.
+    """
+    if pad_px <= 0:
+        return E_blhw
+    Er = torch.view_as_real(E_blhw)  # (B,L,H,W,2)
+    Erp = torch.nn.functional.pad(Er, (0, 0, pad_px, pad_px, pad_px, pad_px), mode="constant", value=0)
+    return torch.view_as_complex(Erp.contiguous())
+
+
+def _complex_crop_blhw(Epad_blhw: torch.Tensor, H: int, W: int, pad_px: int) -> torch.Tensor:
+    if pad_px <= 0:
+        return Epad_blhw
+    p = int(pad_px)
+    return Epad_blhw[..., p : p + H, p : p + W].contiguous()
+
+
+def _save_intensity_frames_multiwl(
+    E_blhw: torch.Tensor,
+    *,
+    out_dir: Path,
+    tag: str,
+    frame_name: str,
+    wavelengths: np.ndarray,
+    dpi: int = 250,
+    cmap: str = "inferno",
+) -> None:
+    """
+    Save per-wavelength intensity images for a given complex field (B=1 expected).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    wls_nm = (np.asarray(wavelengths, dtype=np.float64) * 1e9)
+    I = (E_blhw.abs() ** 2)[0].detach().cpu().numpy()  # (L,H,W)
+
+    for li in range(I.shape[0]):
+        fig, ax = plt.subplots(1, 1, figsize=(5.5, 5))
+        im = ax.imshow(I[li], cmap=cmap)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_title(f"{tag} | {frame_name} | λ idx={li}, {wls_nm[li]:.1f} nm")
+        ax.set_axis_off()
+        fig.tight_layout()
+        fig.savefig(out_dir / f"{tag}_{frame_name}_l{li}_{wls_nm[li]:.1f}nm.png", dpi=dpi, bbox_inches="tight")
+        plt.close(fig)

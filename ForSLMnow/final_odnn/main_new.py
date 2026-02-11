@@ -199,17 +199,19 @@ def save_regression_diagnostics(
     output_dir: Path,
     device: torch.device,
     tag: str,
-    base_wavelength_idx: int,
+    wavelengths: np.ndarray,                 # ✅ NEW: pass wavelengths
     num_samples: int = 3,
 ):
     """
     保存每个样本：
-    - 输出面合波长强度图 + ROI overlay
-    - 真实/预测比例柱状图（选 base_wavelength_idx）
+    - 输出面强度图：sum over λ 一张（总览）
+    - 输出面强度图：每个 λ 单独一张（区分波长）
+    - 真实/预测比例柱状图：每个 λ 单独一张（区分波长）
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
 
+    L_local = int(len(wavelengths))
     N = len(dataset)
     take = min(num_samples, N)
     idxs = list(range(take))
@@ -220,19 +222,21 @@ def save_regression_diagnostics(
             img = img.to(device, dtype=torch.complex64)[None, ...]  # (1,1,H,W)
             y = y.to(device, dtype=torch.float32)[None, ...]        # (1,L,M)
 
-            x = img.repeat(1, L, 1, 1).contiguous()                 # (1,L,H,W)
+            # (1,L,H,W)
+            x = img.repeat(1, L_local, 1, 1).contiguous()
 
-            I_blhw = model(x)                                       # (1,L,H,W)
-            I_sum = I_blhw.sum(dim=1)[0].detach().cpu().numpy()      # (H,W)
+            # (1,L,H,W) intensity
+            I_blhw = model(x)
 
-            pred_energy = intensity_to_roi_energies(I_blhw, roi_masks)  # (1,L,M)
+            # (1,L,M) energies -> ratios
+            pred_energy = intensity_to_roi_energies(I_blhw, roi_masks)
             pred_ratio = pred_energy / (pred_energy.sum(dim=2, keepdim=True) + 1e-12)
 
-            li = int(base_wavelength_idx)
-            y_np = y[0, li].detach().cpu().numpy()                  # (M,)
-            p_np = pred_ratio[0, li].detach().cpu().numpy()         # (M,)
+            # ----------------------------
+            # Figure A: intensity SUM over wavelengths (overview)
+            # ----------------------------
+            I_sum = I_blhw.sum(dim=1)[0].detach().cpu().numpy()      # (H,W)
 
-            # --- Figure 1: intensity + detectors ---
             fig, ax = plt.subplots(1, 1, figsize=(5.5, 5))
             im = ax.imshow(I_sum, cmap="inferno")
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -242,40 +246,77 @@ def save_regression_diagnostics(
             circle_radius = focus_radius
             for idx_region, (x0, x1, y0, y1) in enumerate(evaluation_regions):
                 color = plt.cm.tab20(idx_region % 20)
-                rect = Rectangle((x0, y0), x1 - x0, y1 - y0, linewidth=1.0, edgecolor=color, facecolor="none")
+                rect = Rectangle((x0, y0), x1 - x0, y1 - y0,
+                                 linewidth=1.0, edgecolor=color, facecolor="none")
                 ax.add_patch(rect)
                 cx = (x0 + x1) / 2.0
                 cy = (y0 + y1) / 2.0
-                circ = Circle((cx, cy), radius=circle_radius, linewidth=1.0, edgecolor=color, linestyle="--", fill=False)
+                circ = Circle((cx, cy), radius=circle_radius,
+                              linewidth=1.0, edgecolor=color, linestyle="--", fill=False)
                 ax.add_patch(circ)
                 ax.text(
                     x0 + 1, y0 + 4, f"M{idx_region + 1}",
                     color=color, fontsize=8, weight="bold",
                     ha="left", va="bottom",
-                    bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.4, edgecolor="none"),
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="black",
+                              alpha=0.4, edgecolor="none"),
                 )
 
             fig.tight_layout()
-            fig_path = output_dir / f"{tag}_sample{idx:04d}_intensity.png"
+            fig_path = output_dir / f"{tag}_sample{idx:04d}_intensity_sum.png"
             fig.savefig(fig_path, dpi=300, bbox_inches="tight")
             plt.close(fig)
 
-            # --- Figure 2: bars ---
-            fig2, ax2 = plt.subplots(1, 1, figsize=(6, 3.2))
-            x_axis = np.arange(len(y_np))
-            ax2.bar(x_axis - 0.15, y_np, width=0.3, label="true")
-            ax2.bar(x_axis + 0.15, p_np, width=0.3, label="pred")
-            ax2.set_xticks(x_axis)
-            ax2.set_xticklabels([f"M{i+1}" for i in range(len(y_np))])
-            ax2.set_ylim(0, 1.0)
-            ax2.grid(True, alpha=0.3)
-            ax2.set_title(f"{tag} | sample#{idx} | ratio true vs pred (λ idx={li})")
-            ax2.legend()
-            fig2.tight_layout()
-            fig2_path = output_dir / f"{tag}_sample{idx:04d}_ratio.png"
-            fig2.savefig(fig2_path, dpi=300, bbox_inches="tight")
-            plt.close(fig2)
+            # ----------------------------
+            # Figure B/C: per-wavelength intensity + per-wavelength ratio bars
+            # ----------------------------
+            for li in range(L_local):
+                wl_nm = float(wavelengths[li] * 1e9)
 
+                # ---- intensity @ wavelength li
+                I_li = I_blhw[0, li].detach().cpu().numpy()
+
+                figI, axI = plt.subplots(1, 1, figsize=(5.5, 5))
+                im2 = axI.imshow(I_li, cmap="inferno")
+                figI.colorbar(im2, ax=axI, fraction=0.046, pad=0.04)
+                axI.set_title(f"{tag} | sample#{idx} | output intensity (λ idx={li}, {wl_nm:.1f} nm)")
+                axI.set_axis_off()
+
+                circle_radius = focus_radius
+                for idx_region, (x0, x1, y0, y1) in enumerate(evaluation_regions):
+                    color = plt.cm.tab20(idx_region % 20)
+                    rect = Rectangle((x0, y0), x1 - x0, y1 - y0,
+                                     linewidth=1.0, edgecolor=color, facecolor="none")
+                    axI.add_patch(rect)
+                    cx = (x0 + x1) / 2.0
+                    cy = (y0 + y1) / 2.0
+                    circ = Circle((cx, cy), radius=circle_radius,
+                                  linewidth=1.0, edgecolor=color, linestyle="--", fill=False)
+                    axI.add_patch(circ)
+
+                figI.tight_layout()
+                figI_path = output_dir / f"{tag}_sample{idx:04d}_intensity_l{li}_{wl_nm:.1f}nm.png"
+                figI.savefig(figI_path, dpi=300, bbox_inches="tight")
+                plt.close(figI)
+
+                # ---- ratio bars @ wavelength li
+                y_np = y[0, li].detach().cpu().numpy()                  # (M,)
+                p_np = pred_ratio[0, li].detach().cpu().numpy()         # (M,)
+
+                fig2, ax2 = plt.subplots(1, 1, figsize=(6, 3.2))
+                x_axis = np.arange(len(y_np))
+                ax2.bar(x_axis - 0.15, y_np, width=0.3, label="true")
+                ax2.bar(x_axis + 0.15, p_np, width=0.3, label="pred")
+                ax2.set_xticks(x_axis)
+                ax2.set_xticklabels([f"M{i+1}" for i in range(len(y_np))])
+                ax2.set_ylim(0, 1.0)
+                ax2.grid(True, alpha=0.3)
+                ax2.set_title(f"{tag} | sample#{idx} | ratio true vs pred (λ idx={li}, {wl_nm:.1f} nm)")
+                ax2.legend()
+                fig2.tight_layout()
+                fig2_path = output_dir / f"{tag}_sample{idx:04d}_ratio_l{li}_{wl_nm:.1f}nm.png"
+                fig2.savefig(fig2_path, dpi=300, bbox_inches="tight")
+                plt.close(fig2)
 
 # ----------------------------
 # Load eigenmode data
@@ -720,7 +761,7 @@ for num_layer in num_layer_option:
         output_dir=diag_dir,
         device=device,
         tag=f"multiwl_L{num_layer}",
-        base_wavelength_idx=base_wavelength_idx,
+        wavelengths=wavelengths,  # ✅ NEW
         num_samples=num_superposition_visual_samples if evaluation_mode == "superposition" else min(5, num_modes),
     )
     print(f"✔ Saved regression diagnostics -> {diag_dir}")
