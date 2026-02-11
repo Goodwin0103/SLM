@@ -42,6 +42,12 @@ from odnn_training_eval import build_circular_roi_masks
 # ✅ 复用旧的 superposition 采样上下文（我们会把它的 label map 换成 y_vec）
 from odnn_training_eval import build_superposition_eval_context
 
+# ✅ NEW: 基于 odnn_training_visualization 扩展出来的 MultiWL 可视化
+from odnn_training_visualization import (
+    visualize_model_slices_multiwl,
+    capture_eigenmode_propagation_multiwl,
+)
+
 
 # ----------------------------
 # Reproducibility / device
@@ -99,7 +105,7 @@ z_prop = 120e-6
 z_input_to_first = 40e-6
 
 # ✅ 多波长
-wavelengths = np.array([1550e-9, 1568e-9, 1585e-9], dtype=np.float32)
+wavelengths = np.array([1330e-9, 1568e-9, 1900e-9], dtype=np.float32)
 base_wavelength_idx = 1
 L = len(wavelengths)
 
@@ -113,10 +119,196 @@ padding_ratio = 0.5
 use_apodization = True  # 你的 D2NNModelMultiWL 里没用到这个参数；保留不影响
 apodization_width = 10  # 同上
 
+# ----------------------------
+# NEW: Exports (phasemask / slices 风格)
+# ----------------------------
+export_multiwl_slices = True
+export_multiwl_snapshots = True
+export_phase_png = True
+phase_png_wrap_2pi = True
+
+slice_sample_mode = "random"  # "random" or "fixed"
+slice_fixed_index = 0
+slice_seed = 20251121
+
+z_step = 5e-6          # slices 的 z 步长
+slice_kmax = 20        # 每段最多保存 kmax 个 z 位置（防止图过多）
+
 
 # ----------------------------
 # Utils
 # ----------------------------
+def export_phase_masks_multiwl_per_wavelength(
+    model: D2NNModelMultiWL,
+    *,
+    out_dir: str | Path,
+    tag: str,
+    wavelengths: np.ndarray,
+    save_png: bool = True,
+    wrap_to_2pi: bool = True,
+    dpi: int = 300,
+    cmap: str = "twilight",
+) -> dict[str, str]:
+    """
+    保存：
+    - phase_phi0: (N_layers,H,W)
+    - phase_scaled_by_lambda: (N_layers,L,H,W)
+
+    并按每个波长额外拆分保存：
+    - phase_masks_lambda{nm}nm_{tag}.mat / .npz，其中 phase_scaled: (N_layers,H,W)
+
+    额外（NEW）：
+    - PNG:
+      out_dir/png/phi0/*.png
+      out_dir/png/per_wavelength/lambda_xxxnm/*.png
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    layers = getattr(model, "layers", None)
+    if layers is None or len(layers) == 0:
+        raise ValueError("model.layers not found or empty; cannot export phase masks.")
+
+    wls = np.asarray(wavelengths, dtype=np.float32)  # (L,)
+    L_local = int(wls.shape[0])
+
+    # --- collect phi0 per layer
+    phi0_list: list[np.ndarray] = []
+    lam0_list: list[float] = []
+
+    for layer in layers:
+        phi0_list.append(layer.phase.detach().cpu().numpy().astype(np.float32))  # (H,W)
+        lam0_list.append(float(layer.lam0.detach().cpu().item()))               # scalar
+
+    phase_phi0 = np.stack(phi0_list, axis=0)                 # (N_layers,H,W)
+    lam0_arr = np.asarray(lam0_list, dtype=np.float32)       # (N_layers,)
+
+    # --- scaled per wavelength: (N_layers,L,H,W)
+    phase_scaled = (
+        phase_phi0[:, None, :, :] * (lam0_arr[:, None, None, None] / wls[None, :, None, None])
+    ).astype(np.float32)
+
+    # --- wrapped (for nicer phase visualization)
+    if wrap_to_2pi:
+        phase_phi0_vis = np.remainder(phase_phi0, 2 * np.pi).astype(np.float32)
+        phase_scaled_vis = np.remainder(phase_scaled, 2 * np.pi).astype(np.float32)
+        vmin, vmax = 0.0, 2 * np.pi
+    else:
+        phase_phi0_vis = phase_phi0
+        phase_scaled_vis = phase_scaled
+        vmin, vmax = None, None
+
+    # --- save "all-in-one"
+    npz_path = out_dir / f"phase_masks_allwl_{tag}.npz"
+    np.savez(
+        npz_path,
+        phase_phi0=phase_phi0,
+        phase_scaled_by_lambda=phase_scaled,
+        phase_phi0_vis=phase_phi0_vis,
+        phase_scaled_by_lambda_vis=phase_scaled_vis,
+        wavelengths_m=wls.astype(np.float64),
+        lam0_per_layer_m=lam0_arr.astype(np.float64),
+    )
+
+    mat_path = out_dir / f"phase_masks_allwl_{tag}.mat"
+    savemat(
+        str(mat_path),
+        {
+            "phase_phi0": phase_phi0,
+            "phase_scaled_by_lambda": phase_scaled,
+            "phase_phi0_vis": phase_phi0_vis,
+            "phase_scaled_by_lambda_vis": phase_scaled_vis,
+            "wavelengths_m": wls.astype(np.float64),
+            "lam0_per_layer_m": lam0_arr.astype(np.float64),
+        },
+    )
+
+    # --- additionally: split per wavelength (npz/mat)
+    split_dir = out_dir / "per_wavelength"
+    split_dir.mkdir(parents=True, exist_ok=True)
+
+    for li in range(L_local):
+        wl_nm = float(wls[li] * 1e9)
+        wl_tag = f"{wl_nm:.1f}".replace(".", "p")  # e.g. 1568.0 -> 1568p0
+
+        phase_li = phase_scaled[:, li, :, :]  # (N_layers,H,W)
+
+        npz_li = split_dir / f"phase_masks_lambda{wl_tag}nm_{tag}.npz"
+        np.savez(
+            npz_li,
+            phase_scaled=phase_li,
+            wavelength_m=np.array([wls[li]], dtype=np.float64),
+            lam0_per_layer_m=lam0_arr.astype(np.float64),
+        )
+
+        mat_li = split_dir / f"phase_masks_lambda{wl_tag}nm_{tag}.mat"
+        savemat(
+            str(mat_li),
+            {
+                "phase_scaled": phase_li,
+                "wavelength_m": np.array([wls[li]], dtype=np.float64),
+                "lam0_per_layer_m": lam0_arr.astype(np.float64),
+            },
+        )
+
+    # --- NEW: PNG export
+    if save_png:
+        png_root = out_dir / "png"
+        png_root.mkdir(parents=True, exist_ok=True)
+
+        # phi0 per layer
+        phi0_dir = png_root / "phi0"
+        phi0_dir.mkdir(parents=True, exist_ok=True)
+        for layer_idx in range(phase_phi0_vis.shape[0]):
+            arr = phase_phi0_vis[layer_idx]
+            fig, ax = plt.subplots(1, 1, figsize=(5.2, 5.0))
+            im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("phase (rad)")
+            ax.set_title(f"{tag} | phi0 | layer {layer_idx+1}/{phase_phi0_vis.shape[0]}" + (" | wrapped" if wrap_to_2pi else ""))
+            ax.set_axis_off()
+            fig.tight_layout()
+            fig.savefig(phi0_dir / f"{tag}_phi0_layer{layer_idx+1:02d}.png", dpi=dpi, bbox_inches="tight")
+            plt.close(fig)
+
+        # per wavelength per layer
+        per_wl_dir = png_root / "per_wavelength"
+        per_wl_dir.mkdir(parents=True, exist_ok=True)
+
+        for li in range(L_local):
+            wl_nm = float(wls[li] * 1e9)
+            wl_tag = f"{wl_nm:.1f}".replace(".", "p")
+            wl_dir = per_wl_dir / f"lambda_{wl_tag}nm"
+            wl_dir.mkdir(parents=True, exist_ok=True)
+
+            for layer_idx in range(phase_scaled_vis.shape[0]):
+                arr = phase_scaled_vis[layer_idx, li]
+                fig, ax = plt.subplots(1, 1, figsize=(5.2, 5.0))
+                im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
+                cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                cbar.set_label("phase (rad)")
+                ax.set_title(
+                    f"{tag} | λ={wl_nm:.1f} nm (idx {li}) | layer {layer_idx+1}/{phase_scaled_vis.shape[0]}"
+                    + (" | wrapped" if wrap_to_2pi else "")
+                )
+                ax.set_axis_off()
+                fig.tight_layout()
+                fig.savefig(wl_dir / f"{tag}_lambda{wl_tag}nm_layer{layer_idx+1:02d}.png", dpi=dpi, bbox_inches="tight")
+                plt.close(fig)
+
+        print(f"✔ Saved phase mask PNGs -> {png_root}")
+
+    print(f"✔ Saved phase masks (all wavelengths) -> {npz_path}")
+    print(f"✔ Saved phase masks (all wavelengths) MAT -> {mat_path}")
+    print(f"✔ Saved per-wavelength phase masks -> {split_dir}")
+
+    return {
+        "npz_path": str(npz_path),
+        "mat_path": str(mat_path),
+        "split_dir": str(split_dir),
+        "png_dir": str(out_dir / "png") if save_png else "",
+    }
+
 def build_mode_context(base_modes: np.ndarray, num_modes: int) -> dict:
     if base_modes.shape[2] < num_modes:
         raise ValueError(
@@ -158,28 +350,20 @@ def intensity_to_roi_energies(I_blhw: torch.Tensor, roi_masks: torch.Tensor) -> 
     I_blhw: (B,L,H,W) float intensity
     roi_masks: (M,H,W) float
     return: (B,L,M) energies
-
-    说明：不用 einsum，避免在 CUDA + deterministic 下触发 CuBLAS 非确定性路径。
     """
     I_blhw = I_blhw.to(torch.float32)
     roi_masks = roi_masks.to(torch.float32)
-
-    # (B,L,1,H,W) * (1,1,M,H,W) -> (B,L,M,H,W) -> sum over H,W -> (B,L,M)
     return (I_blhw.unsqueeze(2) * roi_masks.unsqueeze(0).unsqueeze(0)).sum(dim=(-1, -2))
 
+
 def evaluate_ratio_metrics(pred_ratio: torch.Tensor, y_true: torch.Tensor) -> dict:
-    """
-    pred_ratio, y_true: (N,M) float32
-    输出：rmse/mae/cosine/corr 等
-    """
     pred = pred_ratio.detach().cpu().float()
     true = y_true.detach().cpu().float()
 
     err = pred - true
     mae = float(err.abs().mean().item())
     rmse = float(torch.sqrt((err ** 2).mean()).item())
-
-    cos = F.cosine_similarity(pred, true, dim=1).mean().item()
+    cos = float(F.cosine_similarity(pred, true, dim=1).mean().item())
 
     p = pred.flatten()
     t = true.flatten()
@@ -187,7 +371,7 @@ def evaluate_ratio_metrics(pred_ratio: torch.Tensor, y_true: torch.Tensor) -> di
     t0 = t - t.mean()
     corr = float((p0 @ t0 / (torch.sqrt((p0 @ p0) + 1e-12) * torch.sqrt((t0 @ t0) + 1e-12))).item())
 
-    return {"mae": mae, "rmse": rmse, "cosine": float(cos), "pearson": corr}
+    return {"mae": mae, "rmse": rmse, "cosine": cos, "pearson": corr}
 
 
 def save_regression_diagnostics(
@@ -199,15 +383,9 @@ def save_regression_diagnostics(
     output_dir: Path,
     device: torch.device,
     tag: str,
-    wavelengths: np.ndarray,                 # ✅ NEW: pass wavelengths
+    wavelengths: np.ndarray,
     num_samples: int = 3,
 ):
-    """
-    保存每个样本：
-    - 输出面强度图：sum over λ 一张（总览）
-    - 输出面强度图：每个 λ 单独一张（区分波长）
-    - 真实/预测比例柱状图：每个 λ 单独一张（区分波长）
-    """
     output_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
 
@@ -222,21 +400,14 @@ def save_regression_diagnostics(
             img = img.to(device, dtype=torch.complex64)[None, ...]  # (1,1,H,W)
             y = y.to(device, dtype=torch.float32)[None, ...]        # (1,L,M)
 
-            # (1,L,H,W)
-            x = img.repeat(1, L_local, 1, 1).contiguous()
+            x = img.repeat(1, L_local, 1, 1).contiguous()           # (1,L,H,W)
+            I_blhw = model(x)                                       # (1,L,H,W)
 
-            # (1,L,H,W) intensity
-            I_blhw = model(x)
-
-            # (1,L,M) energies -> ratios
             pred_energy = intensity_to_roi_energies(I_blhw, roi_masks)
             pred_ratio = pred_energy / (pred_energy.sum(dim=2, keepdim=True) + 1e-12)
 
-            # ----------------------------
-            # Figure A: intensity SUM over wavelengths (overview)
-            # ----------------------------
-            I_sum = I_blhw.sum(dim=1)[0].detach().cpu().numpy()      # (H,W)
-
+            # --- SUM over wavelengths
+            I_sum = I_blhw.sum(dim=1)[0].detach().cpu().numpy()
             fig, ax = plt.subplots(1, 1, figsize=(5.5, 5))
             im = ax.imshow(I_sum, cmap="inferno")
             fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -246,36 +417,28 @@ def save_regression_diagnostics(
             circle_radius = focus_radius
             for idx_region, (x0, x1, y0, y1) in enumerate(evaluation_regions):
                 color = plt.cm.tab20(idx_region % 20)
-                rect = Rectangle((x0, y0), x1 - x0, y1 - y0,
-                                 linewidth=1.0, edgecolor=color, facecolor="none")
+                rect = Rectangle((x0, y0), x1 - x0, y1 - y0, linewidth=1.0, edgecolor=color, facecolor="none")
                 ax.add_patch(rect)
                 cx = (x0 + x1) / 2.0
                 cy = (y0 + y1) / 2.0
-                circ = Circle((cx, cy), radius=circle_radius,
-                              linewidth=1.0, edgecolor=color, linestyle="--", fill=False)
+                circ = Circle((cx, cy), radius=circle_radius, linewidth=1.0, edgecolor=color, linestyle="--", fill=False)
                 ax.add_patch(circ)
                 ax.text(
                     x0 + 1, y0 + 4, f"M{idx_region + 1}",
                     color=color, fontsize=8, weight="bold",
                     ha="left", va="bottom",
-                    bbox=dict(boxstyle="round,pad=0.2", facecolor="black",
-                              alpha=0.4, edgecolor="none"),
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.4, edgecolor="none"),
                 )
 
             fig.tight_layout()
-            fig_path = output_dir / f"{tag}_sample{idx:04d}_intensity_sum.png"
-            fig.savefig(fig_path, dpi=300, bbox_inches="tight")
+            fig.savefig(output_dir / f"{tag}_sample{idx:04d}_intensity_sum.png", dpi=300, bbox_inches="tight")
             plt.close(fig)
 
-            # ----------------------------
-            # Figure B/C: per-wavelength intensity + per-wavelength ratio bars
-            # ----------------------------
+            # --- per wavelength intensity + ratio bars
             for li in range(L_local):
                 wl_nm = float(wavelengths[li] * 1e9)
 
-                # ---- intensity @ wavelength li
                 I_li = I_blhw[0, li].detach().cpu().numpy()
-
                 figI, axI = plt.subplots(1, 1, figsize=(5.5, 5))
                 im2 = axI.imshow(I_li, cmap="inferno")
                 figI.colorbar(im2, ax=axI, fraction=0.046, pad=0.04)
@@ -285,23 +448,20 @@ def save_regression_diagnostics(
                 circle_radius = focus_radius
                 for idx_region, (x0, x1, y0, y1) in enumerate(evaluation_regions):
                     color = plt.cm.tab20(idx_region % 20)
-                    rect = Rectangle((x0, y0), x1 - x0, y1 - y0,
-                                     linewidth=1.0, edgecolor=color, facecolor="none")
+                    rect = Rectangle((x0, y0), x1 - x0, y1 - y0, linewidth=1.0, edgecolor=color, facecolor="none")
                     axI.add_patch(rect)
                     cx = (x0 + x1) / 2.0
                     cy = (y0 + y1) / 2.0
-                    circ = Circle((cx, cy), radius=circle_radius,
-                                  linewidth=1.0, edgecolor=color, linestyle="--", fill=False)
+                    circ = Circle((cx, cy), radius=circle_radius, linewidth=1.0, edgecolor=color, linestyle="--", fill=False)
                     axI.add_patch(circ)
 
                 figI.tight_layout()
-                figI_path = output_dir / f"{tag}_sample{idx:04d}_intensity_l{li}_{wl_nm:.1f}nm.png"
-                figI.savefig(figI_path, dpi=300, bbox_inches="tight")
+                figI.savefig(output_dir / f"{tag}_sample{idx:04d}_intensity_l{li}_{wl_nm:.1f}nm.png",
+                             dpi=300, bbox_inches="tight")
                 plt.close(figI)
 
-                # ---- ratio bars @ wavelength li
-                y_np = y[0, li].detach().cpu().numpy()                  # (M,)
-                p_np = pred_ratio[0, li].detach().cpu().numpy()         # (M,)
+                y_np = y[0, li].detach().cpu().numpy()
+                p_np = pred_ratio[0, li].detach().cpu().numpy()
 
                 fig2, ax2 = plt.subplots(1, 1, figsize=(6, 3.2))
                 x_axis = np.arange(len(y_np))
@@ -314,9 +474,23 @@ def save_regression_diagnostics(
                 ax2.set_title(f"{tag} | sample#{idx} | ratio true vs pred (λ idx={li}, {wl_nm:.1f} nm)")
                 ax2.legend()
                 fig2.tight_layout()
-                fig2_path = output_dir / f"{tag}_sample{idx:04d}_ratio_l{li}_{wl_nm:.1f}nm.png"
-                fig2.savefig(fig2_path, dpi=300, bbox_inches="tight")
+                fig2.savefig(output_dir / f"{tag}_sample{idx:04d}_ratio_l{li}_{wl_nm:.1f}nm.png",
+                             dpi=300, bbox_inches="tight")
                 plt.close(fig2)
+
+
+def build_uniform_fractions(n: int, *, include_endpoints: bool = False) -> tuple[float, ...]:
+    """
+    n: 你希望在(0,1)之间取多少个点
+    include_endpoints=False -> 只取内部点：1/(n+1), 2/(n+1), ..., n/(n+1)
+    """
+    if n <= 0:
+        return ()
+    if include_endpoints:
+        vals = np.linspace(0.0, 1.0, n, dtype=np.float64)
+        return tuple(float(x) for x in vals)
+    vals = np.linspace(1.0/(n+1), n/(n+1), n, dtype=np.float64)
+    return tuple(float(x) for x in vals)
 
 # ----------------------------
 # Load eigenmode data
@@ -448,7 +622,7 @@ print("roi_masks:", tuple(roi_masks.shape))
 
 
 # ----------------------------
-# Build training & test datasets (NEW: label is y_vec not label_map)
+# Build training & test datasets (label is y_vec)
 # ----------------------------
 def build_eigenmode_dataset() -> tuple[TensorDataset, TensorDataset, dict]:
     if phase_option == 4:
@@ -460,11 +634,9 @@ def build_eigenmode_dataset() -> tuple[TensorDataset, TensorDataset, dict]:
         phases = base_phases
         num_samples = amplitudes.shape[0]
 
-    # labels: (N,L,M)
     y_vec = amplitudes_to_yvec(amplitudes)                 # (N,M)
     y_vec = y_vec[:, None, :].repeat(1, L, 1).contiguous() # (N,L,M)
 
-    # fields
     complex_weights = amplitudes * np.exp(1j * phases)
     complex_weights_ts = torch.from_numpy(complex_weights.astype(np.complex64))
     image_data = generate_fields_ts(
@@ -484,17 +656,13 @@ def build_eigenmode_dataset() -> tuple[TensorDataset, TensorDataset, dict]:
 
 
 def build_superposition_dataset(num_samples: int, rng_seed: int) -> tuple[TensorDataset, dict]:
-    """
-    复用 build_superposition_eval_context 生成的 image_data / amplitudes / phases，
-    但把 label_map 替换成 y_vec（能量比例向量）。
-    """
     ctx = build_superposition_eval_context(
         num_samples,
         num_modes=num_modes,
         field_size=field_size,
         layer_size=layer_size,
         mmf_modes=MMF_data_ts,
-        mmf_label_data=MMF_Label_data,   # 这里只是为了让它跑通生成 dataset，我们不使用它的 label_map
+        mmf_label_data=MMF_Label_data,
         batch_size=batch_size,
         second_mode_half_range=True,
         rng_seed=rng_seed,
@@ -606,7 +774,6 @@ for num_layer in num_layer_option:
             pred_ratio  = pred_energy / (pred_energy.sum(dim=2, keepdim=True) + 1e-12)
 
             loss = F.mse_loss(pred_ratio, y)
-
             loss.backward()
             optimizer.step()
             epoch_loss += float(loss.item())
@@ -712,6 +879,87 @@ for num_layer in num_layer_option:
     save_path = os.path.join(ckpt_dir, f"odnn_multiwl_{int(num_layer)}layers_m{num_modes}_ls{layer_size}.pth")
     torch.save(ckpt, save_path)
     print("✔ Saved model ->", save_path)
+    # ----------------------------
+    # Export phase masks (phi0 + scaled-by-lambda)
+    # ----------------------------
+    phase_dir = Path("results/phase_masks_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    export_phase_masks_multiwl_per_wavelength(
+        model,
+        out_dir=phase_dir,
+        tag=f"multiwl_L{num_layer}_m{num_modes}_ls{layer_size}",
+        wavelengths=wavelengths,
+        save_png=export_phase_png,
+        wrap_to_2pi=phase_png_wrap_2pi,
+    )
+
+
+
+    # ============================================================
+    # Export MultiWL propagation slices + key snapshots
+    # ============================================================
+    if export_multiwl_slices:
+        if slice_sample_mode == "random":
+            rng = np.random.default_rng(slice_seed)
+            sample_idx = int(rng.integers(low=0, high=len(test_ds)))
+        else:
+            sample_idx = int(slice_fixed_index) % len(test_ds)
+
+        input_E_1hw = test_ds.tensors[0][sample_idx].to(device, dtype=torch.complex64)  # (1,H,W)
+
+        slices_dir = Path("results/propagation_slices_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        scans, camera_field = visualize_model_slices_multiwl(
+            model,
+            input_field=input_E_1hw,
+            output_dir=slices_dir,
+            sample_tag=f"multiwl_L{num_layer}_s{sample_idx:04d}",
+            z_input_to_first=float(z_input_to_first),
+            z_layers=float(z_layers),
+            z_prop_plus=float(z_prop),
+            z_step=float(z_step),
+            pixel_size=float(pixel_size),
+            wavelengths=wavelengths,
+            kmax=int(slice_kmax),
+            cmap="inferno",
+        )
+        np.savez(slices_dir / "camera_field_multiwl.npz", camera_field=camera_field)
+        print(f"✔ Saved MultiWL slices -> {slices_dir}")
+
+    if export_multiwl_snapshots:
+        snap_dir = Path("results/propagation_snapshots_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        eigenmode_index = min(2, MMF_data_ts.shape[0] - 1)
+
+        fractions_per_segment = 25  # ✅ 越大越密，20/25/40 都行
+        dense = np.linspace(
+            1.0 / (fractions_per_segment + 1),
+            fractions_per_segment / (fractions_per_segment + 1),
+            fractions_per_segment,
+            dtype=np.float64,
+        )
+        dense = tuple(float(x) for x in dense)
+
+        num_layers_local = len(model.layers)
+        fractions_between_layers = tuple(dense for _ in range(num_layers_local))
+        output_fractions = dense
+
+        summary = capture_eigenmode_propagation_multiwl(
+            model,
+            eigenmode_field=MMF_data_ts[eigenmode_index],
+            mode_index=int(eigenmode_index),
+            layer_size=int(layer_size),
+            z_input_to_first=float(z_input_to_first),
+            z_layers=float(z_layers),
+            z_prop=float(z_prop),
+            pixel_size=float(pixel_size),
+            wavelengths=wavelengths,
+            output_dir=snap_dir,
+            tag=f"multiwl_L{num_layer}",
+            base_wavelength_idx=int(base_wavelength_idx),
+            fractions_between_layers=fractions_between_layers,  # ✅ NEW
+            output_fractions=output_fractions,                  # ✅ NEW
+        )
+        print(f"✔ Saved MultiWL snapshots -> {summary['fig_path']}")
+        print(f"✔ Saved MultiWL snapshots MAT -> {summary['mat_path']}")
+
 
     # ----------------------------
     # Evaluate (ratio regression metrics)
@@ -724,9 +972,9 @@ for num_layer in num_layer_option:
             images = images.to(device, dtype=torch.complex64, non_blocking=True)
             y = y.to(device, dtype=torch.float32, non_blocking=True)
 
-            x = images.repeat(1, L, 1, 1).contiguous()                 # (B,L,H,W)
-            I_blhw = model(x)                                          # (B,L,H,W)
-            pred_energy = intensity_to_roi_energies(I_blhw, roi_masks) # (B,L,M)
+            x = images.repeat(1, L, 1, 1).contiguous()
+            I_blhw = model(x)
+            pred_energy = intensity_to_roi_energies(I_blhw, roi_masks)
             pred_ratio = pred_energy / (pred_energy.sum(dim=2, keepdim=True) + 1e-12)
 
             preds.append(pred_ratio.detach().cpu())
@@ -736,7 +984,7 @@ for num_layer in num_layer_option:
     true_all = torch.cat(trues, dim=0)        # (N,L,M)
 
     metrics = evaluate_ratio_metrics(
-        pred_all.reshape(-1, num_modes),      # (N*L, M)
+        pred_all.reshape(-1, num_modes),
         true_all.reshape(-1, num_modes),
     )
     metrics["num_layers"] = int(num_layer)
@@ -761,7 +1009,7 @@ for num_layer in num_layer_option:
         output_dir=diag_dir,
         device=device,
         tag=f"multiwl_L{num_layer}",
-        wavelengths=wavelengths,  # ✅ NEW
+        wavelengths=wavelengths,
         num_samples=num_superposition_visual_samples if evaluation_mode == "superposition" else min(5, num_modes),
     )
     print(f"✔ Saved regression diagnostics -> {diag_dir}")
@@ -837,3 +1085,4 @@ if model_metrics:
 
     print(f"✔ Metrics vs. layers plot saved -> {metrics_plot_path}")
     print(f"✔ Metrics vs. layers data (.mat) -> {metrics_mat_path}")
+#%%

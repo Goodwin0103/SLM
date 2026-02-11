@@ -1330,3 +1330,361 @@ def _save_intensity_frames_multiwl(
         fig.tight_layout()
         fig.savefig(out_dir / f"{tag}_{frame_name}_l{li}_{wls_nm[li]:.1f}nm.png", dpi=dpi, bbox_inches="tight")
         plt.close(fig)
+@torch.no_grad()
+def visualize_model_slices_multiwl(
+    model: torch.nn.Module,
+    input_field: torch.Tensor,
+    *,
+    output_dir: str | Path,
+    sample_tag: str,
+    z_input_to_first: float,
+    z_layers: float,
+    z_prop_plus: float,
+    z_step: float,
+    pixel_size: float,
+    wavelengths: np.ndarray,
+    kmax: int = 25,
+    cmap: str = "inferno",
+) -> tuple[dict[str, dict[str, np.ndarray]], np.ndarray]:
+    """
+    MultiWL version of visualize_model_slices:
+    - input_field: (H,W) or (1,H,W) complex
+    - saves intensity slices for EACH wavelength at sampled z positions
+    - returns scans (np stacks) + camera_field (complex) as numpy
+
+    Notes:
+    - Uses the SAME physics as D2NNModelMultiWL:
+      pre_propagation -> [phase(mask scaled per λ) + propagate]xN -> propagation
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = next(model.parameters()).device
+    model.eval()
+
+    if input_field.ndim == 3:
+        plane_hw = input_field.squeeze(0)
+    else:
+        plane_hw = input_field
+    plane_hw = plane_hw.to(device=device, dtype=torch.complex64)
+
+    # infer sizes
+    H, W = int(plane_hw.shape[-2]), int(plane_hw.shape[-1])
+    L = int(len(wavelengths))
+
+    # pad px: follow your model's modules
+    pad_px = int(getattr(getattr(model, "pre_propagation", None), "pad_px", 0))
+
+    # prepare (B=1,L,H,W)
+    field = plane_hw[None, None, ...].repeat(1, L, 1, 1).contiguous()
+
+    # kz for padded canvas
+    Np = H + 2 * pad_px
+    kz_pad = _make_kz_stack_multiwl(Np, float(pixel_size), np.asarray(wavelengths, dtype=np.float32), device)
+
+    scans: dict[str, dict[str, np.ndarray]] = {}
+
+    def sample_segment(
+        E_in: torch.Tensor,
+        *,
+        z_total: float,
+        seg_name: str,
+    ) -> torch.Tensor:
+        # build sampled z list (cap by kmax for saving)
+        if z_step <= 0:
+            raise ValueError("z_step must be > 0")
+        steps = int(np.floor(z_total / z_step)) + 1 if z_total > 0 else 1
+        z_values = np.linspace(0.0, max(0.0, z_total), steps)
+
+        # pad once, propagate many times
+        Epad = _complex_pad_blhw(E_in, pad_px) if pad_px > 0 else E_in
+
+        frames: list[np.ndarray] = []
+        z_kept: list[float] = []
+
+        # choose indices to save (up to kmax)
+        total = len(z_values)
+        keep = min(total, int(kmax))
+        keep_idx = np.linspace(0, total - 1, keep, dtype=int) if total > 1 else np.array([0], dtype=int)
+
+        for idx in keep_idx:
+            z = float(z_values[idx])
+            Etmp = _propagate_multiwl_kz(Epad, kz_pad, z)
+            Eshow = _complex_crop_blhw(Etmp, H, W, pad_px) if pad_px > 0 else Etmp
+            _save_intensity_frames_multiwl(
+                Eshow,
+                out_dir=output_dir,
+                tag=sample_tag,
+                frame_name=f"{seg_name}_z{z*1e6:.1f}um",
+                wavelengths=wavelengths,
+                cmap=cmap,
+            )
+            frames.append(Eshow.detach().cpu().numpy().astype(np.complex64))  # (1,L,H,W)
+            z_kept.append(z)
+
+        # store stacks
+        stack = np.stack(frames, axis=0)  # (K,1,L,H,W)
+        scans[seg_name] = {
+            "stack": stack,
+            "z": np.asarray(z_kept, dtype=np.float64),
+        }
+
+        # propagate to the END of segment
+        Epad_out = _propagate_multiwl_kz(Epad, kz_pad, float(z_total))
+        E_out = _complex_crop_blhw(Epad_out, H, W, pad_px) if pad_px > 0 else Epad_out
+        return E_out
+
+    # 1) input -> first layer
+    field = sample_segment(field, z_total=float(z_input_to_first), seg_name="scan_input_to_L1")
+
+    # 2) each diffraction layer: apply scaled mask then propagate z_layers
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        raise ValueError("model.layers not found. This function expects D2NNModelMultiWL-like modules.")
+
+    for li, layer in enumerate(layers):
+        # build scaled phase (same as DiffractionLayerMultiWL.forward)
+        # scale: (L,)
+        lam0 = layer.lam0.to(device=device)
+        wl_buf = layer.wavelengths.to(device=device)  # (L,)
+        scale = (lam0 / wl_buf)  # (L,)
+
+        phi0 = layer.phase.to(device=device, dtype=torch.float32)  # (H,W)
+        phi = phi0[None, :, :] * scale[:, None, None]            # (L,H,W)
+        phase_c = torch.exp(1j * phi).to(torch.complex64)         # (L,H,W)
+
+        field = field * phase_c[None, ...]                        # (1,L,H,W)
+        field = sample_segment(field, z_total=float(z_layers), seg_name=f"scan_after_mask_L{li+1:02d}")
+
+    # 3) last -> camera
+    field = sample_segment(field, z_total=float(z_prop_plus), seg_name="scan_to_camera")
+
+    # return camera complex field (L,H,W) as numpy
+    camera_field = field[0].detach().cpu().numpy().astype(np.complex64)  # (L,H,W)
+    return scans, camera_field
+
+@torch.no_grad()
+def capture_eigenmode_propagation_multiwl(
+    model: torch.nn.Module,
+    eigenmode_field: torch.Tensor,
+    *,
+    mode_index: int,
+    layer_size: int,
+    z_input_to_first: float,
+    z_layers: float,
+    z_prop: float,
+    pixel_size: float,
+    wavelengths: np.ndarray,
+    output_dir: str | Path,
+    tag: str,
+    base_wavelength_idx: int = 0,
+    fractions_between_layers: Sequence[Sequence[float]] | None = None,
+    output_fractions: Sequence[float] | None = None,
+) -> dict[str, str]:
+    """
+    MultiWL version (dense snapshots supported):
+    - records: input, arrival before L1, per-layer propagation snapshots, after last layer, output plane
+    - figure: show base_wavelength_idx only (to avoid huge figure)
+    - mat: save ALL wavelengths complex fields/intensities: fields(K,L,H,W)
+    """
+    device = next(model.parameters()).device
+    model.eval()
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- prepare input (H,W) -> (1,L,H,W)
+    mode_field = eigenmode_field.to(device=device, dtype=torch.complex64)
+    padded_field = pad_field_to_layer(mode_field, layer_size)  # (H,W)
+    H, W = int(padded_field.shape[-2]), int(padded_field.shape[-1])
+    L = int(len(wavelengths))
+
+    field = padded_field[None, None, ...].repeat(1, L, 1, 1).contiguous()  # (1,L,H,W)
+
+    # ---- defaults for snapshot fractions
+    layers = getattr(model, "layers", None)
+    if layers is None or len(layers) == 0:
+        raise ValueError("model.layers not found or empty.")
+
+    num_layers = len(layers)
+    if fractions_between_layers is None:
+        # mimic your single-wl defaults: internal points for each layer segment, last can be ()
+        default: list[tuple[float, ...]] = []
+        for li in range(num_layers):
+            if li < num_layers - 1:
+                default.append((1.0 / 3.0, 2.0 / 3.0))
+            else:
+                default.append((1.0 / 3.0, 2.0 / 3.0))  # last layer segment too (feel free to make () )
+        fractions_between_layers = tuple(default)
+
+    if output_fractions is None:
+        output_fractions = (0.2, 0.4, 0.6, 0.8)
+
+    # ---- pad & kz (use pre_propagation pad if exists)
+    pad_px = int(getattr(getattr(model, "pre_propagation", None), "pad_px", 0))
+    Np = H + 2 * pad_px
+    kz_pad = _make_kz_stack_multiwl(Np, float(pixel_size), np.asarray(wavelengths, dtype=np.float32), device)
+
+    records: list[dict[str, Any]] = []
+
+    def add_record(key: str, desc: str, E_blhw: torch.Tensor, z_value: float) -> None:
+        E_np = E_blhw[0].detach().cpu().numpy().astype(np.complex64)  # (L,H,W)
+        records.append({"key": key, "description": desc, "z": float(z_value), "field": E_np})
+
+    def propagate_full(E_in: torch.Tensor, z_total: float) -> torch.Tensor:
+        Epad = _complex_pad_blhw(E_in, pad_px) if pad_px > 0 else E_in
+        Epad_out = _propagate_multiwl_kz(Epad, kz_pad, float(z_total))
+        return _complex_crop_blhw(Epad_out, H, W, pad_px) if pad_px > 0 else Epad_out
+
+    def propagate_with_fractions(
+        E_in: torch.Tensor,
+        *,
+        z_total: float,
+        fractions: Sequence[float],
+        stage_label: str,
+        z_base: float,
+    ) -> torch.Tensor:
+        # use sorted unique fractions within (0,1)
+        fr = [float(f) for f in fractions]
+        fr = [f for f in fr if 0.0 < f < 1.0]
+        fr = sorted(set(fr))
+
+        if fr:
+            Epad = _complex_pad_blhw(E_in, pad_px) if pad_px > 0 else E_in
+            for idx, f in enumerate(fr, start=1):
+                dist = float(z_total) * float(f)
+                Etmp = _propagate_multiwl_kz(Epad, kz_pad, dist)
+                Eshow = _complex_crop_blhw(Etmp, H, W, pad_px) if pad_px > 0 else Etmp
+                add_record(
+                    f"{stage_label}_prop{idx}",
+                    f"{stage_label} propagation ({f:.2f}·z)",
+                    Eshow,
+                    z_base + dist,
+                )
+
+        return propagate_full(E_in, float(z_total))
+
+    # ----------------------------
+    # record input
+    # ----------------------------
+    z_cur = 0.0
+    add_record("input", f"Input eigenmode {mode_index + 1} (padded)", field, z_cur)
+
+    # input -> L1
+    field = propagate_full(field, float(z_input_to_first))
+    z_cur += float(z_input_to_first)
+    add_record("arrive_L1", "Arrival at layer 1 (before mask)", field, z_cur)
+
+    # ----------------------------
+    # layers: (mask) + (prop with snapshots)
+    # ----------------------------
+    for li, layer in enumerate(layers):
+        # apply scaled mask (same as your multiwl layer)
+        lam0 = layer.lam0.to(device=device)
+        wl_buf = layer.wavelengths.to(device=device)
+        scale = (lam0 / wl_buf)  # (L,)
+
+        phi0 = layer.phase.to(device=device, dtype=torch.float32)      # (H,W)
+        phi = phi0[None, :, :] * scale[:, None, None]                 # (L,H,W)
+        phase_c = torch.exp(1j * phi).to(torch.complex64)              # (L,H,W)
+
+        field = field * phase_c[None, ...]
+        add_record(f"after_mask_L{li+1}", f"After mask L{li+1}", field, z_cur)
+
+        fracs = fractions_between_layers[li] if li < len(fractions_between_layers) else ()
+        stage_label = f"L{li+1}_to_L{li+2}" if li < num_layers - 1 else f"L{li+1}_internal"
+
+        z_base = z_cur
+        field = propagate_with_fractions(
+            field,
+            z_total=float(z_layers),
+            fractions=fracs,
+            stage_label=stage_label,
+            z_base=z_base,
+        )
+        z_cur += float(z_layers)
+
+        add_record(
+            f"arrive_L{li+2}" if li < num_layers - 1 else "after_last_layer",
+            f"Arrival at layer {li+2}" if li < num_layers - 1 else "After last layer",
+            field,
+            z_cur,
+        )
+
+    # ----------------------------
+    # last -> output (with snapshots)
+    # ----------------------------
+    z_base = z_cur
+    field = propagate_with_fractions(
+        field,
+        z_total=float(z_prop),
+        fractions=output_fractions,
+        stage_label="layers_to_output",
+        z_base=z_base,
+    )
+    z_cur += float(z_prop)
+    add_record("output_plane", "Output plane (before detector)", field, z_cur)
+
+    # detector intensity (full L)
+    output_intensity = (field.abs() ** 2)[0].detach().cpu().numpy().astype(np.float32)  # (L,H,W)
+
+    # --- overview figure using base_wavelength_idx only
+    base_idx = int(np.clip(base_wavelength_idx, 0, L - 1))
+    intensity_stack_base = np.stack([np.abs(r["field"][base_idx]) ** 2 for r in records], axis=0)  # (K,H,W)
+    vmax = float(np.percentile(intensity_stack_base, 99.5))
+    vmax = vmax if np.isfinite(vmax) and vmax > 0 else float(np.max(intensity_stack_base) if intensity_stack_base.size else 1.0)
+
+    K = len(records)
+    ncols = 4
+    nrows = (K + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3.0 * nrows))
+    axes = np.array(axes).reshape(-1)
+
+    last_im = None
+    for i, rec in enumerate(records):
+        im = axes[i].imshow(np.abs(rec["field"][base_idx]) ** 2, cmap="inferno", vmin=0, vmax=vmax)
+        axes[i].set_title(f"{i+1}. {rec['description']}", fontsize=8)
+        axes[i].axis("off")
+        last_im = im
+    for i in range(K, len(axes)):
+        axes[i].axis("off")
+
+    if last_im is not None:
+        fig.colorbar(last_im, ax=axes[:K], fraction=0.025, pad=0.02)
+
+    fig.suptitle(f"MultiWL propagation snapshots | mode {mode_index+1} | base λ idx={base_idx}")
+    fig_path = output_dir / f"propagation_multiwl_mode{mode_index+1}_{tag}.png"
+    fig.savefig(fig_path, dpi=300)
+    plt.close(fig)
+
+    # --- MAT export (store all L)
+    slice_names = np.array([r["key"] for r in records], dtype=object)
+    slice_desc = np.array([r["description"] for r in records], dtype=object)
+    z_positions = np.array([r["z"] for r in records], dtype=np.float64)
+    field_stack = np.stack([r["field"] for r in records], axis=0).astype(np.complex64)  # (K,L,H,W)
+    intensity_stack_all = (np.abs(field_stack) ** 2).astype(np.float32)                  # (K,L,H,W)
+    energy_trace = intensity_stack_all.reshape(intensity_stack_all.shape[0], -1).sum(axis=1).astype(np.float64)
+
+    mat_path = output_dir / f"propagation_multiwl_mode{mode_index+1}_{tag}.mat"
+    savemat(
+        str(mat_path),
+        {
+            "fields": field_stack,
+            "intensities": intensity_stack_all,
+            "energies": energy_trace,
+            "slice_names": slice_names,
+            "slice_descriptions": slice_desc,
+            "z_positions_m": z_positions,
+            "output_intensity": output_intensity,
+            "mode_index": np.array([mode_index + 1], dtype=np.int32),
+            "layer_size": np.array([layer_size], dtype=np.int32),
+            "pixel_size": np.array([pixel_size], dtype=np.float64),
+            "wavelengths_m": np.asarray(wavelengths, dtype=np.float64),
+            "z_input_to_first": np.array([z_input_to_first], dtype=np.float64),
+            "z_layers": np.array([z_layers], dtype=np.float64),
+            "z_prop": np.array([z_prop], dtype=np.float64),
+            "base_wavelength_idx": np.array([base_idx], dtype=np.int32),
+        },
+    )
+
+    return {"fig_path": str(fig_path), "mat_path": str(mat_path)}
