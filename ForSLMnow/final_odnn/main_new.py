@@ -1,6 +1,7 @@
 #%%
 import math
 import os
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8' 
 import random
 import time
 from datetime import datetime
@@ -109,12 +110,12 @@ z_prop = 120e-6
 z_input_to_first = 40e-6
 
 # ✅ 多波长
-wavelengths = np.array([650e-9, 1568e-9, 1900e-9], dtype=np.float32)
+# wavelengths = np.array([650e-9, 1568e-9, 1650e-9], dtype=np.float32)
+# wavelengths = np.array([1550e-9, 1568e-9, 1650e-9], dtype=np.float32)
+wavelengths = np.array([650e-9], dtype=np.float32)
 base_wavelength_idx = 0
 L = len(wavelengths)
 
-
-# phase sampling option (和旧代码一致)
 phase_option = 4
 
 # training hyperparams
@@ -592,6 +593,11 @@ def save_regression_diagnostics(
     wavelengths: np.ndarray,
     num_samples: int = 3,
 ):
+    """
+    为每个样本、每个波长生成 4 子图诊断图：
+    - 左侧 3 图：Label、Prediction、|Pred - Label|
+    - 右侧 1 图：归一化振幅条形图对比
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     model.eval()
 
@@ -612,78 +618,140 @@ def save_regression_diagnostics(
             pred_energy = intensity_to_roi_energies(I_blhw, roi_masks)
             pred_ratio = pred_energy / (pred_energy.sum(dim=2, keepdim=True) + 1e-12)
 
-            # --- SUM over wavelengths
-            I_sum = I_blhw.sum(dim=1)[0].detach().cpu().numpy()
-            fig, ax = plt.subplots(1, 1, figsize=(5.5, 5))
-            im = ax.imshow(I_sum, cmap="inferno")
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            ax.set_title(f"{tag} | sample#{idx} | output intensity (sum over λ)")
-            ax.set_axis_off()
-
-            circle_radius = focus_radius
-            for idx_region, (x0, x1, y0, y1) in enumerate(evaluation_regions):
-                color = plt.cm.tab20(idx_region % 20)
-                rect = Rectangle((x0, y0), x1 - x0, y1 - y0, linewidth=1.0, edgecolor=color, facecolor="none")
-                ax.add_patch(rect)
-                cx = (x0 + x1) / 2.0
-                cy = (y0 + y1) / 2.0
-                circ = Circle((cx, cy), radius=circle_radius, linewidth=1.0, edgecolor=color, linestyle="--", fill=False)
-                ax.add_patch(circ)
-                ax.text(
-                    x0 + 1, y0 + 4, f"M{idx_region + 1}",
-                    color=color, fontsize=8, weight="bold",
-                    ha="left", va="bottom",
-                    bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.4, edgecolor="none"),
-                )
-
-            fig.tight_layout()
-            fig.savefig(output_dir / f"{tag}_sample{idx:04d}_intensity_sum.png", dpi=300, bbox_inches="tight")
-            plt.close(fig)
-
-            # --- per wavelength intensity + ratio bars
+            # ============================================================
+            # ✅ 为每个波长生成 4 子图诊断图
+            # ============================================================
             for li in range(L_local):
                 wl_nm = float(wavelengths[li] * 1e9)
 
-                I_li = I_blhw[0, li].detach().cpu().numpy()
-                figI, axI = plt.subplots(1, 1, figsize=(5.5, 5))
-                im2 = axI.imshow(I_li, cmap="inferno")
-                figI.colorbar(im2, ax=axI, fraction=0.046, pad=0.04)
-                axI.set_title(f"{tag} | sample#{idx} | output intensity (λ idx={li}, {wl_nm:.1f} nm)")
-                axI.set_axis_off()
+                # 提取当前波长的数据
+                label_map = y[0, li].detach().cpu().numpy()       # (M,)
+                pred_map = pred_ratio[0, li].detach().cpu().numpy()  # (M,)
+                I_li = I_blhw[0, li].detach().cpu().numpy()       # (H, W)
 
+                # ============================================================
+                # ✅ 构建 Label 和 Prediction 的 2D 热图（用 ROI masks 重建）
+                # ============================================================
+                label_2d = np.zeros((layer_size, layer_size), dtype=np.float32)
+                pred_2d = np.zeros((layer_size, layer_size), dtype=np.float32)
+
+                roi_masks_np = roi_masks.detach().cpu().numpy()  # (M, H, W)
+                for k in range(len(label_map)):
+                    label_2d += label_map[k] * roi_masks_np[k]
+                    pred_2d += pred_map[k] * roi_masks_np[k]
+
+                # 计算差异图
+                diff_2d = np.abs(pred_2d - label_2d)
+
+                # ============================================================
+                # ✅ 创建 4 子图布局
+                # ============================================================
+                fig = plt.figure(figsize=(16, 4))
+                gs = fig.add_gridspec(1, 4, width_ratios=[1, 1, 1, 1.2], wspace=0.3)
+
+                ax_label = fig.add_subplot(gs[0, 0])
+                ax_pred = fig.add_subplot(gs[0, 1])
+                ax_diff = fig.add_subplot(gs[0, 2])
+                ax_bar = fig.add_subplot(gs[0, 3])
+
+                # ============================================================
+                # ✅ 子图 1: Label
+                # ============================================================
+                im_label = ax_label.imshow(label_2d, cmap="inferno", vmin=0.0, vmax=label_2d.max())
+                cbar_label = fig.colorbar(im_label, ax=ax_label, fraction=0.046, pad=0.04)
+                ax_label.set_title("Label", fontsize=11)
+                ax_label.set_axis_off()
+
+                # 绘制 ROI 边界（虚线圆圈）
                 circle_radius = focus_radius
                 for idx_region, (x0, x1, y0, y1) in enumerate(evaluation_regions):
                     color = plt.cm.tab20(idx_region % 20)
-                    rect = Rectangle((x0, y0), x1 - x0, y1 - y0, linewidth=1.0, edgecolor=color, facecolor="none")
-                    axI.add_patch(rect)
                     cx = (x0 + x1) / 2.0
                     cy = (y0 + y1) / 2.0
-                    circ = Circle((cx, cy), radius=circle_radius, linewidth=1.0, edgecolor=color, linestyle="--", fill=False)
-                    axI.add_patch(circ)
+                    circ = Circle(
+                        (cx, cy), radius=circle_radius,
+                        linewidth=1.0, edgecolor=color, linestyle="--", fill=False
+                    )
+                    ax_label.add_patch(circ)
 
-                figI.tight_layout()
-                figI.savefig(output_dir / f"{tag}_sample{idx:04d}_intensity_l{li}_{wl_nm:.1f}nm.png",
-                             dpi=300, bbox_inches="tight")
-                plt.close(figI)
+                # ============================================================
+                # ✅ 子图 2: Prediction
+                # ============================================================
+                im_pred = ax_pred.imshow(pred_2d, cmap="inferno", vmin=0.0, vmax=pred_2d.max())
+                cbar_pred = fig.colorbar(im_pred, ax=ax_pred, fraction=0.046, pad=0.04)
+                ax_pred.set_title("Prediction", fontsize=11)
+                ax_pred.set_axis_off()
 
-                y_np = y[0, li].detach().cpu().numpy()
-                p_np = pred_ratio[0, li].detach().cpu().numpy()
+                # 绘制 ROI 边界
+                for idx_region, (x0, x1, y0, y1) in enumerate(evaluation_regions):
+                    color = plt.cm.tab20(idx_region % 20)
+                    cx = (x0 + x1) / 2.0
+                    cy = (y0 + y1) / 2.0
+                    circ = Circle(
+                        (cx, cy), radius=circle_radius,
+                        linewidth=1.0, edgecolor=color, linestyle="--", fill=False
+                    )
+                    ax_pred.add_patch(circ)
 
-                fig2, ax2 = plt.subplots(1, 1, figsize=(6, 3.2))
-                x_axis = np.arange(len(y_np))
-                ax2.bar(x_axis - 0.15, y_np, width=0.3, label="true")
-                ax2.bar(x_axis + 0.15, p_np, width=0.3, label="pred")
-                ax2.set_xticks(x_axis)
-                ax2.set_xticklabels([f"M{i+1}" for i in range(len(y_np))])
-                ax2.set_ylim(0, 1.0)
-                ax2.grid(True, alpha=0.3)
-                ax2.set_title(f"{tag} | sample#{idx} | ratio true vs pred (λ idx={li}, {wl_nm:.1f} nm)")
-                ax2.legend()
-                fig2.tight_layout()
-                fig2.savefig(output_dir / f"{tag}_sample{idx:04d}_ratio_l{li}_{wl_nm:.1f}nm.png",
-                             dpi=300, bbox_inches="tight")
-                plt.close(fig2)
+                # ============================================================
+                # ✅ 子图 3: |Pred - Label|
+                # ============================================================
+                im_diff = ax_diff.imshow(diff_2d, cmap="inferno", vmin=0.0, vmax=diff_2d.max())
+                cbar_diff = fig.colorbar(im_diff, ax=ax_diff, fraction=0.046, pad=0.04)
+                ax_diff.set_title("|Pred - Label|", fontsize=11)
+                ax_diff.set_axis_off()
 
+                # 绘制 ROI 边界
+                for idx_region, (x0, x1, y0, y1) in enumerate(evaluation_regions):
+                    color = plt.cm.tab20(idx_region % 20)
+                    cx = (x0 + x1) / 2.0
+                    cy = (y0 + y1) / 2.0
+                    circ = Circle(
+                        (cx, cy), radius=circle_radius,
+                        linewidth=1.0, edgecolor=color, linestyle="--", fill=False
+                    )
+                    ax_diff.add_patch(circ)
+
+                # ============================================================
+                # ✅ 子图 4: 归一化振幅条形图
+                # ============================================================
+                x_axis = np.arange(len(label_map))
+                bar_width = 0.35
+
+                ax_bar.bar(
+                    x_axis - bar_width / 2, label_map, width=bar_width,
+                    label="Label", color="tab:blue", alpha=0.8
+                )
+                ax_bar.bar(
+                    x_axis + bar_width / 2, pred_map, width=bar_width,
+                    label="Pred", color="tab:orange", alpha=0.8
+                )
+
+                ax_bar.set_xticks(x_axis)
+                ax_bar.set_xticklabels([f"M{i+1}" for i in range(len(label_map))])
+                ax_bar.set_ylim(0, 1.0)
+                ax_bar.set_ylabel("Normalized detector amplitudes", fontsize=10)
+                ax_bar.set_title("Normalized detector amplitudes", fontsize=11)
+                ax_bar.legend(loc="upper right", fontsize=9)
+                ax_bar.grid(True, alpha=0.3, axis="y")
+
+                # ============================================================
+                # ✅ 全局标题
+                # ============================================================
+                fig.suptitle(
+                    f"Sample {idx + 1} ({tag}) | λ idx={li}, {wl_nm:.1f} nm",
+                    fontsize=13, weight="bold"
+                )
+
+                # ============================================================
+                # ✅ 保存图片
+                # ============================================================
+                fig.tight_layout(rect=(0, 0, 1, 0.96))
+                save_path = output_dir / f"{tag}_sample{idx:04d}_diagnostic_l{li}_{wl_nm:.1f}nm.png"
+                fig.savefig(save_path, dpi=300, bbox_inches="tight")
+                plt.close(fig)
+
+                print(f"  ✔ Saved diagnostic -> {save_path}")
 
 def build_uniform_fractions(n: int, *, include_endpoints: bool = False) -> tuple[float, ...]:
     if n <= 0:
@@ -769,7 +837,7 @@ evaluation_regions = create_evaluation_regions(layer_size, layer_size, num_detec
 print("Detection Regions:", evaluation_regions)
 
 if show_detection_overlap_debug:
-    detection_debug_dir = Path("results/detection_region_debug")
+    detection_debug_dir = Path("results/1150_1568_1650_base0/detection_region_debug")
     detection_debug_dir.mkdir(parents=True, exist_ok=True)
     overlap_map = np.zeros((layer_size, layer_size), dtype=np.float32)
     for (x0, x1, y0, y1) in evaluation_regions:
@@ -1059,7 +1127,7 @@ for num_layer in num_layer_option:
     # ----------------------------
     # Save training curves
     # ----------------------------
-    training_output_dir = Path("results/training_analysis")
+    training_output_dir = Path("results/1150_1568_1650_base0/training_analysis")
     training_output_dir.mkdir(parents=True, exist_ok=True)
 
     epochs_array = np.arange(1, epochs + 1, dtype=np.int32)
@@ -1137,7 +1205,7 @@ for num_layer in num_layer_option:
     # ----------------------------
     # Export phase masks
     # ----------------------------
-    phase_dir = Path("results/phase_masks_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    phase_dir = Path("results/1150_1568_1650_base0/phase_masks_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     phase_dir.mkdir(parents=True, exist_ok=True)
 
     tag = f"multiwl_L{num_layer}_m{num_modes}_ls{layer_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -1191,7 +1259,7 @@ for num_layer in num_layer_option:
 
         input_E_1hw = test_ds.tensors[0][sample_idx].to(device, dtype=torch.complex64)
 
-        slices_dir = Path("results/propagation_slices_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        slices_dir = Path("results/1150_1568_1650_base0/propagation_slices_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         scans, camera_field = visualize_model_slices_multiwl(
             model,
             input_field=input_E_1hw,
@@ -1210,10 +1278,10 @@ for num_layer in num_layer_option:
         print(f"✔ Saved MultiWL slices -> {slices_dir}")
 
     if export_multiwl_snapshots:
-        snap_dir = Path("results/propagation_snapshots_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        snap_dir = Path("results/1150_1568_1650_base0/propagation_snapshots_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         eigenmode_index = min(2, MMF_data_ts.shape[0] - 1)
 
-        fractions_per_segment = 10
+        fractions_per_segment = 5
         dense = np.linspace(
             1.0 / (fractions_per_segment + 1),
             fractions_per_segment / (fractions_per_segment + 1),
@@ -1258,6 +1326,9 @@ for num_layer in num_layer_option:
     # ----------------------------
     # Evaluate (ratio regression metrics)
     # ----------------------------
+# ----------------------------
+# Evaluate (ratio regression metrics per wavelength)
+# ----------------------------
     model.eval()
     preds = []
     trues = []
@@ -1274,27 +1345,50 @@ for num_layer in num_layer_option:
             preds.append(pred_ratio.detach().cpu())
             trues.append(y.detach().cpu())
 
-    pred_all = torch.cat(preds, dim=0)        # (N,L,M)
-    true_all = torch.cat(trues, dim=0)        # (N,L,M)
+    pred_all = torch.cat(preds, dim=0)  # (N, L, M)
+    true_all = torch.cat(trues, dim=0)  # (N, L, M)
 
-    metrics = evaluate_ratio_metrics(
-        pred_all.reshape(-1, num_modes),
-        true_all.reshape(-1, num_modes),
-    )
-    metrics["num_layers"] = int(num_layer)
-    metrics["evaluation_mode"] = evaluation_mode
-    model_metrics.append(metrics)
+    # ✅ 为每个波长单独计算指标
+    metrics_per_wavelength = []
+    for li in range(L):
+        wl_nm = float(wavelengths[li] * 1e9)
+        metrics_li = evaluate_ratio_metrics(
+            pred_all[:, li, :],  # (N, M)
+            true_all[:, li, :],  # (N, M)
+        )
+        metrics_li["wavelength_nm"] = wl_nm
+        metrics_li["wavelength_idx"] = li
+        metrics_per_wavelength.append(metrics_li)
+        
+        print(
+            f"[Metrics | {num_layer} layers | λ={wl_nm:.1f}nm] "
+            f"MAE={metrics_li['mae']:.6f}, RMSE={metrics_li['rmse']:.6f}, "
+            f"Cosine={metrics_li['cosine']:.6f}, Pearson={metrics_li['pearson']:.6f}"
+        )
+
+    # ✅ 计算所有波长的平均指标（用于单值汇总）
+    metrics_avg = {
+        "mae": float(np.mean([m["mae"] for m in metrics_per_wavelength])),
+        "rmse": float(np.mean([m["rmse"] for m in metrics_per_wavelength])),
+        "cosine": float(np.mean([m["cosine"] for m in metrics_per_wavelength])),
+        "pearson": float(np.mean([m["pearson"] for m in metrics_per_wavelength])),
+    }
+    metrics_avg["num_layers"] = int(num_layer)
+    metrics_avg["evaluation_mode"] = evaluation_mode
+    metrics_avg["per_wavelength"] = metrics_per_wavelength  # ← 保存每个波长的详细指标
+
+    model_metrics.append(metrics_avg)
 
     print(
-        f"[Metrics | {num_layer} layers] "
-        f"MAE={metrics['mae']:.6f}, RMSE={metrics['rmse']:.6f}, "
-        f"Cosine={metrics['cosine']:.6f}, Pearson={metrics['pearson']:.6f}"
+        f"[Average Metrics | {num_layer} layers] "
+        f"MAE={metrics_avg['mae']:.6f}, RMSE={metrics_avg['rmse']:.6f}, "
+        f"Cosine={metrics_avg['cosine']:.6f}, Pearson={metrics_avg['pearson']:.6f}"
     )
 
     # ----------------------------
     # Save diagnostics figures
     # ----------------------------
-    diag_dir = Path("results/prediction_viz") / f"multiwl_L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    diag_dir = Path("results/1150_1568_1650_base0/prediction_viz") / f"multiwl_L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     save_regression_diagnostics(
         model=model,
         dataset=test_ds,
@@ -1317,7 +1411,7 @@ for num_layer in num_layer_option:
             "mat_path": str(mat_path),
             "ckpt_path": str(save_path),
             "diagnostics_dir": str(diag_dir),
-            "metrics": metrics,
+            "metrics": metrics_avg,
         }
     )
 
@@ -1327,56 +1421,106 @@ for num_layer in num_layer_option:
 print("Done.")
 
 
-#%% Metrics vs. layer count (save plot + mat)
+#%% Metrics vs. layer count (per wavelength + average)
 if model_metrics:
-    metrics_dir = Path("results/metrics_analysis")
+    metrics_dir = Path("results/1150_1568_1650_base0/metrics_analysis")
     metrics_dir.mkdir(parents=True, exist_ok=True)
     metrics_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     layer_counts = np.asarray([m["num_layers"] for m in model_metrics], dtype=np.int32)
-    mae = np.asarray([m["mae"] for m in model_metrics], dtype=np.float64)
-    rmse = np.asarray([m["rmse"] for m in model_metrics], dtype=np.float64)
-    cosine = np.asarray([m["cosine"] for m in model_metrics], dtype=np.float64)
-    pearson = np.asarray([m["pearson"] for m in model_metrics], dtype=np.float64)
+    
+    # ✅ 提取每个波长的指标
+    L_wl = len(wavelengths)
+    mae_per_wl = np.zeros((len(layer_counts), L_wl), dtype=np.float64)
+    rmse_per_wl = np.zeros((len(layer_counts), L_wl), dtype=np.float64)
+    cosine_per_wl = np.zeros((len(layer_counts), L_wl), dtype=np.float64)
+    pearson_per_wl = np.zeros((len(layer_counts), L_wl), dtype=np.float64)
+    
+    for i, m in enumerate(model_metrics):
+        for li in range(L_wl):
+            mae_per_wl[i, li] = m["per_wavelength"][li]["mae"]
+            rmse_per_wl[i, li] = m["per_wavelength"][li]["rmse"]
+            cosine_per_wl[i, li] = m["per_wavelength"][li]["cosine"]
+            pearson_per_wl[i, li] = m["per_wavelength"][li]["pearson"]
+    
+    # ✅ 平均指标
+    mae_avg = np.asarray([m["mae"] for m in model_metrics], dtype=np.float64)
+    rmse_avg = np.asarray([m["rmse"] for m in model_metrics], dtype=np.float64)
+    cosine_avg = np.asarray([m["cosine"] for m in model_metrics], dtype=np.float64)
+    pearson_avg = np.asarray([m["pearson"] for m in model_metrics], dtype=np.float64)
 
-    fig, axes = plt.subplots(4, 1, figsize=(7, 10), sharex=True)
-
-    axes[0].plot(layer_counts, mae, marker="o")
+    # ✅ 绘制多波长对比图
+    fig, axes = plt.subplots(4, 1, figsize=(8, 11), sharex=True)
+    
+    colors = ['tab:blue', 'tab:orange', 'tab:green']
+    wl_labels = [f"{wl*1e9:.0f} nm" for wl in wavelengths]
+    
+    # MAE
+    for li in range(L_wl):
+        axes[0].plot(layer_counts, mae_per_wl[:, li], marker='o', color=colors[li], 
+                     label=wl_labels[li], alpha=0.7)
+    axes[0].plot(layer_counts, mae_avg, marker='s', color='black', 
+                 label='Average', linewidth=2, markersize=8)
     axes[0].set_ylabel("MAE")
+    axes[0].legend(loc='best', fontsize=9)
     axes[0].grid(True, alpha=0.3)
-
-    axes[1].plot(layer_counts, rmse, marker="o", color="tab:orange")
+    
+    # RMSE
+    for li in range(L_wl):
+        axes[1].plot(layer_counts, rmse_per_wl[:, li], marker='o', color=colors[li], 
+                     label=wl_labels[li], alpha=0.7)
+    axes[1].plot(layer_counts, rmse_avg, marker='s', color='black', 
+                 label='Average', linewidth=2, markersize=8)
     axes[1].set_ylabel("RMSE")
+    axes[1].legend(loc='best', fontsize=9)
     axes[1].grid(True, alpha=0.3)
-
-    axes[2].plot(layer_counts, cosine, marker="o", color="tab:green")
+    
+    # Cosine
+    for li in range(L_wl):
+        axes[2].plot(layer_counts, cosine_per_wl[:, li], marker='o', color=colors[li], 
+                     label=wl_labels[li], alpha=0.7)
+    axes[2].plot(layer_counts, cosine_avg, marker='s', color='black', 
+                 label='Average', linewidth=2, markersize=8)
     axes[2].set_ylabel("Cosine")
+    axes[2].legend(loc='best', fontsize=9)
     axes[2].grid(True, alpha=0.3)
-
-    axes[3].plot(layer_counts, pearson, marker="o", color="tab:purple")
+    
+    # Pearson
+    for li in range(L_wl):
+        axes[3].plot(layer_counts, pearson_per_wl[:, li], marker='o', color=colors[li], 
+                     label=wl_labels[li], alpha=0.7)
+    axes[3].plot(layer_counts, pearson_avg, marker='s', color='black', 
+                 label='Average', linewidth=2, markersize=8)
     axes[3].set_xlabel("Number of layers")
     axes[3].set_ylabel("Pearson")
+    axes[3].legend(loc='best', fontsize=9)
     axes[3].grid(True, alpha=0.3)
 
-    fig.suptitle(f"Regression metrics vs. layer count ({evaluation_mode})", fontsize=13)
+    fig.suptitle(f"Regression metrics vs. layer count ({evaluation_mode}) | Multi-wavelength", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
     metrics_plot_path = metrics_dir / f"metrics_vs_layers_multiwl_{metrics_tag}.png"
     fig.savefig(metrics_plot_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
+    # ✅ 保存 MAT 文件
     metrics_mat_path = metrics_dir / f"metrics_vs_layers_multiwl_{metrics_tag}.mat"
     savemat(
         str(metrics_mat_path),
         {
             "layers": layer_counts.astype(np.float64),
-            "mae": mae,
-            "rmse": rmse,
-            "cosine": cosine,
-            "pearson": pearson,
+            "wavelengths_nm": (wavelengths * 1e9).astype(np.float64),
+            "mae_per_wavelength": mae_per_wl,
+            "rmse_per_wavelength": rmse_per_wl,
+            "cosine_per_wavelength": cosine_per_wl,
+            "pearson_per_wavelength": pearson_per_wl,
+            "mae_average": mae_avg,
+            "rmse_average": rmse_avg,
+            "cosine_average": cosine_avg,
+            "pearson_average": pearson_avg,
         },
     )
 
-    print(f"✔ Metrics vs. layers plot saved -> {metrics_plot_path}")
+    print(f"✔ Metrics vs. layers plot (multi-wavelength) saved -> {metrics_plot_path}")
     print(f"✔ Metrics vs. layers data (.mat) -> {metrics_mat_path}")
 #%%
