@@ -1213,7 +1213,7 @@ for num_layer in num_layer_option:
         snap_dir = Path("results/propagation_snapshots_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         eigenmode_index = min(2, MMF_data_ts.shape[0] - 1)
 
-        fractions_per_segment = 25
+        fractions_per_segment = 10
         dense = np.linspace(
             1.0 / (fractions_per_segment + 1),
             fractions_per_segment / (fractions_per_segment + 1),
