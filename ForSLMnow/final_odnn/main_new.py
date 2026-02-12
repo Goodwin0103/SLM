@@ -1226,24 +1226,33 @@ for num_layer in num_layer_option:
         fractions_between_layers = tuple(dense for _ in range(num_layers_local))
         output_fractions = dense
 
-        summary = capture_eigenmode_propagation_multiwl(
-            model,
-            eigenmode_field=MMF_data_ts[eigenmode_index],
-            mode_index=int(eigenmode_index),
-            layer_size=int(layer_size),
-            z_input_to_first=float(z_input_to_first),
-            z_layers=float(z_layers),
-            z_prop=float(z_prop),
-            pixel_size=float(pixel_size),
-            wavelengths=wavelengths,
-            output_dir=snap_dir,
-            tag=f"multiwl_L{num_layer}",
-            base_wavelength_idx=int(base_wavelength_idx),
-            fractions_between_layers=fractions_between_layers,
-            output_fractions=output_fractions,
-        )
-        print(f"✔ Saved MultiWL snapshots -> {summary['fig_path']}")
-        print(f"✔ Saved MultiWL snapshots MAT -> {summary['mat_path']}")
+        # ✅ 修改：为每个波长单独生成 PNG
+        for li, wl in enumerate(wavelengths):
+            wl_nm = float(wl * 1e9)
+            wl_tag = f"{wl_nm:.1f}".replace(".", "p")
+            
+            print(f"\n  Generating snapshots for λ={wl_nm:.1f} nm (idx {li})...")
+            
+            summary = capture_eigenmode_propagation_multiwl(
+                model,
+                eigenmode_field=MMF_data_ts[eigenmode_index],
+                mode_index=int(eigenmode_index),
+                layer_size=int(layer_size),
+                z_input_to_first=float(z_input_to_first),
+                z_layers=float(z_layers),
+                z_prop=float(z_prop),
+                pixel_size=float(pixel_size),
+                wavelengths=wavelengths,
+                output_dir=snap_dir,
+                tag=f"multiwl_L{num_layer}_lambda{wl_tag}nm",
+                base_wavelength_idx=int(li),  # ← 关键：使用当前波长索引
+                fractions_between_layers=fractions_between_layers,
+                output_fractions=output_fractions,
+            )
+            print(f"  ✔ Saved λ={wl_nm:.1f}nm PNG -> {summary['fig_path']}")
+            print(f"  ✔ Saved λ={wl_nm:.1f}nm MAT -> {summary['mat_path']}")
+        
+        print(f"\n✔ All wavelength snapshots saved to -> {snap_dir}")
 
 
     # ----------------------------
