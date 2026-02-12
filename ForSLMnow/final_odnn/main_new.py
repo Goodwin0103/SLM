@@ -48,6 +48,10 @@ from odnn_training_visualization import (
     capture_eigenmode_propagation_multiwl,
 )
 
+# ✅ NEW: 用于 free_space_propagate
+from odnn_model import complex_crop, complex_pad
+from odnn_processing import pad_field_to_layer
+
 
 # ----------------------------
 # Reproducibility / device
@@ -105,9 +109,10 @@ z_prop = 120e-6
 z_input_to_first = 40e-6
 
 # ✅ 多波长
-wavelengths = np.array([650-9, 1568e-9, 1900e-9], dtype=np.float32)
-base_wavelength_idx = 1
+wavelengths = np.array([650e-9, 1568e-9, 1900e-9], dtype=np.float32)
+base_wavelength_idx = 0
 L = len(wavelengths)
+
 
 # phase sampling option (和旧代码一致)
 phase_option = 4
@@ -116,8 +121,8 @@ phase_option = 4
 epochs = 1000
 lr = 1.99
 padding_ratio = 0.5
-use_apodization = True  # 你的 D2NNModelMultiWL 里没用到这个参数；保留不影响
-apodization_width = 10  # 同上
+use_apodization = True
+apodization_width = 10
 
 # ----------------------------
 # NEW: Exports (phasemask / slices 风格)
@@ -131,9 +136,8 @@ slice_sample_mode = "random"  # "random" or "fixed"
 slice_fixed_index = 0
 slice_seed = 20251121
 
-z_step = 5e-6          # slices 的 z 步长
-slice_kmax = 20        # 每段最多保存 kmax 个 z 位置（防止图过多）
-
+z_step = 5e-6
+slice_kmax = 20
 
 # ----------------------------
 # Utils
@@ -149,19 +153,6 @@ def export_phase_masks_multiwl_per_wavelength(
     dpi: int = 300,
     cmap: str = "twilight",
 ) -> dict[str, str]:
-    """
-    保存：
-    - phase_phi0: (N_layers,H,W)
-    - phase_scaled_by_lambda: (N_layers,L,H,W)
-
-    并按每个波长额外拆分保存：
-    - phase_masks_lambda{nm}nm_{tag}.mat / .npz，其中 phase_scaled: (N_layers,H,W)
-
-    额外（NEW）：
-    - PNG:
-      out_dir/png/phi0/*.png
-      out_dir/png/per_wavelength/lambda_xxxnm/*.png
-    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -169,26 +160,23 @@ def export_phase_masks_multiwl_per_wavelength(
     if layers is None or len(layers) == 0:
         raise ValueError("model.layers not found or empty; cannot export phase masks.")
 
-    wls = np.asarray(wavelengths, dtype=np.float32)  # (L,)
+    wls = np.asarray(wavelengths, dtype=np.float32)
     L_local = int(wls.shape[0])
 
-    # --- collect phi0 per layer
     phi0_list: list[np.ndarray] = []
     lam0_list: list[float] = []
 
     for layer in layers:
-        phi0_list.append(layer.phase.detach().cpu().numpy().astype(np.float32))  # (H,W)
-        lam0_list.append(float(layer.lam0.detach().cpu().item()))               # scalar
+        phi0_list.append(layer.phase.detach().cpu().numpy().astype(np.float32))
+        lam0_list.append(float(layer.lam0.detach().cpu().item()))
 
-    phase_phi0 = np.stack(phi0_list, axis=0)                 # (N_layers,H,W)
-    lam0_arr = np.asarray(lam0_list, dtype=np.float32)       # (N_layers,)
+    phase_phi0 = np.stack(phi0_list, axis=0)
+    lam0_arr = np.asarray(lam0_list, dtype=np.float32)
 
-    # --- scaled per wavelength: (N_layers,L,H,W)
     phase_scaled = (
         phase_phi0[:, None, :, :] * (lam0_arr[:, None, None, None] / wls[None, :, None, None])
     ).astype(np.float32)
 
-    # --- wrapped (for nicer phase visualization)
     if wrap_to_2pi:
         phase_phi0_vis = np.remainder(phase_phi0, 2 * np.pi).astype(np.float32)
         phase_scaled_vis = np.remainder(phase_scaled, 2 * np.pi).astype(np.float32)
@@ -198,7 +186,6 @@ def export_phase_masks_multiwl_per_wavelength(
         phase_scaled_vis = phase_scaled
         vmin, vmax = None, None
 
-    # --- save "all-in-one"
     npz_path = out_dir / f"phase_masks_allwl_{tag}.npz"
     np.savez(
         npz_path,
@@ -223,15 +210,14 @@ def export_phase_masks_multiwl_per_wavelength(
         },
     )
 
-    # --- additionally: split per wavelength (npz/mat)
     split_dir = out_dir / "per_wavelength"
     split_dir.mkdir(parents=True, exist_ok=True)
 
     for li in range(L_local):
         wl_nm = float(wls[li] * 1e9)
-        wl_tag = f"{wl_nm:.1f}".replace(".", "p")  # e.g. 1568.0 -> 1568p0
+        wl_tag = f"{wl_nm:.1f}".replace(".", "p")
 
-        phase_li = phase_scaled[:, li, :, :]  # (N_layers,H,W)
+        phase_li = phase_scaled[:, li, :, :]
 
         npz_li = split_dir / f"phase_masks_lambda{wl_tag}nm_{tag}.npz"
         np.savez(
@@ -251,12 +237,10 @@ def export_phase_masks_multiwl_per_wavelength(
             },
         )
 
-    # --- NEW: PNG export
     if save_png:
         png_root = out_dir / "png"
         png_root.mkdir(parents=True, exist_ok=True)
 
-        # phi0 per layer
         phi0_dir = png_root / "phi0"
         phi0_dir.mkdir(parents=True, exist_ok=True)
         for layer_idx in range(phase_phi0_vis.shape[0]):
@@ -271,7 +255,6 @@ def export_phase_masks_multiwl_per_wavelength(
             fig.savefig(phi0_dir / f"{tag}_phi0_layer{layer_idx+1:02d}.png", dpi=dpi, bbox_inches="tight")
             plt.close(fig)
 
-        # per wavelength per layer
         per_wl_dir = png_root / "per_wavelength"
         per_wl_dir.mkdir(parents=True, exist_ok=True)
 
@@ -310,7 +293,7 @@ def export_phase_masks_multiwl_per_wavelength(
     }
 
 def save_phase_masks_grid_png(
-    phase_stack_nhw: np.ndarray,   # (N,H,W)
+    phase_stack_nhw: np.ndarray,
     *,
     save_path: str | Path,
     title: str,
@@ -318,7 +301,6 @@ def save_phase_masks_grid_png(
     wrap_to_2pi: bool = True,
     dpi: int = 300,
 ):
-    """把 N 层相位 mask 画成一张拼图 PNG（每层一个子图 + colorbar）。"""
     phase = np.asarray(phase_stack_nhw, dtype=np.float32)
     if phase.ndim != 3:
         raise ValueError(f"phase_stack_nhw must be (N,H,W), got {phase.shape}")
@@ -330,7 +312,7 @@ def save_phase_masks_grid_png(
         vmin, vmax = None, None
 
     N = phase.shape[0]
-    fig_w = max(10, 2.6 * N)   # 让 6 层不会太挤
+    fig_w = max(10, 2.6 * N)
     fig, axes = plt.subplots(1, N, figsize=(fig_w, 3.0), squeeze=False)
     axes = axes[0]
 
@@ -351,13 +333,13 @@ def save_phase_masks_grid_png(
     plt.close(fig)
 
 def save_phase_masks_grid_wl_x_layer_png(
-    phase_scaled_by_lambda_lLHW: np.ndarray,  # (N_layers, L, H, W)
-    wavelengths_m: np.ndarray,                # (L,)
+    phase_scaled_by_lambda_lLHW: np.ndarray,
+    wavelengths_m: np.ndarray,
     *,
     save_path: str | Path,
     title: str,
     cmap: str = "hsv",
-    wrapped: bool = True,   # True 表示数据已在 [0,2pi)
+    wrapped: bool = True,
     dpi: int = 300,
 ):
     arr = np.asarray(phase_scaled_by_lambda_lLHW, dtype=np.float32)
@@ -374,7 +356,6 @@ def save_phase_masks_grid_wl_x_layer_png(
     else:
         vmin, vmax = None, None
 
-    # 行=波长，列=layer；预留右侧空间放 colorbar
     fig_w = max(10, 2.2 * N_layers) + 0.9
     fig_h = max(3.5, 2.0 * L_local)
     fig, axes = plt.subplots(L_local, N_layers, figsize=(fig_w, fig_h), squeeze=False)
@@ -400,9 +381,8 @@ def save_phase_masks_grid_wl_x_layer_png(
 
     fig.suptitle(title, fontsize=12)
 
-    # ✅ 先排版，确保子图占满；再在右侧“额外加一个轴”放 colorbar
-    fig.tight_layout(rect=(0, 0, 0.92, 0.95))   # 右侧保留 8% 宽度给 colorbar
-    cax = fig.add_axes([0.94, 0.18, 0.015, 0.64])  # [left, bottom, width, height] in figure coords
+    fig.tight_layout(rect=(0, 0, 0.92, 0.95))
+    cax = fig.add_axes([0.94, 0.18, 0.015, 0.64])
     cbar = fig.colorbar(im_ref, cax=cax)
     cbar.set_label("Phase (rad)", fontsize=10)
 
@@ -448,6 +428,129 @@ def amplitudes_to_yvec(amplitudes: np.ndarray) -> torch.Tensor:
     return e / (e.sum(dim=1, keepdim=True) + 1e-12)
 
 
+# ============================================================
+# ✅ NEW: 自由空间角谱传播 + 按波长生成物理真实标签
+# ============================================================
+
+def free_space_propagate(
+    field_hw: torch.Tensor,
+    wavelength: float,
+    z_total: float,
+    pixel_size_m: float,
+    target_size: int,
+    padding_ratio_val: float = 0.5,
+    dev: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """
+    对单个 2D 复数场做自由空间角谱传播，返回输出平面的强度 (H, W)。
+    """
+    H, W = field_hw.shape
+    if H != target_size or W != target_size:
+        E = pad_field_to_layer(field_hw.unsqueeze(0), target_size).squeeze(0)
+    else:
+        E = field_hw.clone()
+    E = E.to(device=dev, dtype=torch.complex64)
+
+    pad_px = int(round(target_size * padding_ratio_val))
+    N_pad = target_size + 2 * pad_px
+
+    E_pad = complex_pad(E, pad_px, pad_px)
+
+    fx = torch.fft.fftfreq(N_pad, d=pixel_size_m, device=dev)
+    fy = torch.fft.fftfreq(N_pad, d=pixel_size_m, device=dev)
+    fxx, fyy = torch.meshgrid(fx, fy, indexing='ij')
+
+    k = 2 * math.pi / wavelength
+    kz_sq = k**2 - (2 * math.pi * fxx)**2 - (2 * math.pi * fyy)**2
+
+    kz = torch.zeros_like(kz_sq)
+    propagating = kz_sq > 0
+    kz[propagating] = torch.sqrt(kz_sq[propagating])
+
+    H_transfer = torch.exp(1j * kz * z_total)
+    H_transfer[~propagating] = 0.0
+
+    E_freq = torch.fft.fft2(E_pad)
+    E_out_pad = torch.fft.ifft2(E_freq * H_transfer)
+
+    E_out = complex_crop(E_out_pad, target_size, target_size, pad_px, pad_px)
+    I_out = torch.abs(E_out) ** 2
+    return I_out
+
+
+def compute_per_wavelength_labels(
+    amplitudes: np.ndarray,
+    mmf_modes: torch.Tensor,
+    wls: np.ndarray,
+    masks: torch.Tensor,
+    ls: int,
+    px: float,
+    z_tot: float,
+    dev: torch.device,
+    pad_ratio: float = 0.5,
+) -> torch.Tensor:
+    """
+    为每个样本、每个波长生成物理真实的能量比例标签。
+
+    amplitudes: (N, M)
+    mmf_modes:  (M, H_field, W_field) complex
+    wls:        (L,) wavelengths in meters
+    masks:      (M_roi, H, W) on device
+    ls:         layer_size
+    px:         pixel_size
+    z_tot:      总自由空间传播距离
+    dev:        device
+    pad_ratio:  padding_ratio
+
+    Returns: (N, L, M_roi) float tensor on CPU
+    """
+    N, M = amplitudes.shape
+    L_wl = len(wls)
+    M_roi = masks.shape[0]
+
+    # Step 1 & 2: 计算每个模式在每个波长下的 ROI 能量分布
+    E_ref = torch.zeros(M, L_wl, M_roi, dtype=torch.float32, device=dev)
+
+    print(f"  Computing per-wavelength labels (z_total={z_tot*1e6:.1f} μm) ...")
+    with torch.no_grad():
+        for m in range(M):
+            mode_field = mmf_modes[m]
+            for li in range(L_wl):
+                lam = float(wls[li])
+                I_out = free_space_propagate(
+                    field_hw=mode_field,
+                    wavelength=lam,
+                    z_total=z_tot,
+                    pixel_size_m=px,
+                    target_size=ls,
+                    padding_ratio_val=pad_ratio,
+                    dev=dev,
+                )
+                for k in range(M_roi):
+                    E_ref[m, li, k] = (I_out * masks[k]).sum()
+
+    # debug 打印
+    for m in range(M):
+        for li in range(L_wl):
+            wl_nm = wls[li] * 1e9
+            ratios = E_ref[m, li] / (E_ref[m, li].sum() + 1e-12)
+            print(f"    Mode {m}, λ={wl_nm:.1f}nm: ROI ratios = "
+                  f"{ratios.cpu().numpy().round(4)}")
+
+    # Step 3: 对每个样本，按振幅的平方加权（不相干叠加）
+    amp_sq = torch.from_numpy(
+        (amplitudes ** 2).astype(np.float32)
+    ).to(dev)
+
+    # einsum: (N,M) x (M,L,K) -> (N,L,K)
+    y_energy = torch.einsum('nm, mlk -> nlk', amp_sq, E_ref)
+
+    # 归一化为比例
+    y_vec = y_energy / (y_energy.sum(dim=2, keepdim=True) + 1e-12)
+
+    return y_vec.cpu()
+
+
 def intensity_to_roi_energies(I_blhw: torch.Tensor, roi_masks: torch.Tensor) -> torch.Tensor:
     """
     I_blhw: (B,L,H,W) float intensity
@@ -481,7 +584,7 @@ def save_regression_diagnostics(
     *,
     model: D2NNModelMultiWL,
     dataset: TensorDataset,
-    roi_masks: torch.Tensor,                 # (M,H,W) on device
+    roi_masks: torch.Tensor,
     evaluation_regions: list[tuple[int,int,int,int]],
     output_dir: Path,
     device: torch.device,
@@ -500,11 +603,11 @@ def save_regression_diagnostics(
     with torch.no_grad():
         for idx in idxs:
             img, y = dataset[idx]
-            img = img.to(device, dtype=torch.complex64)[None, ...]  # (1,1,H,W)
-            y = y.to(device, dtype=torch.float32)[None, ...]        # (1,L,M)
+            img = img.to(device, dtype=torch.complex64)[None, ...]
+            y = y.to(device, dtype=torch.float32)[None, ...]
 
-            x = img.repeat(1, L_local, 1, 1).contiguous()           # (1,L,H,W)
-            I_blhw = model(x)                                       # (1,L,H,W)
+            x = img.repeat(1, L_local, 1, 1).contiguous()
+            I_blhw = model(x)
 
             pred_energy = intensity_to_roi_energies(I_blhw, roi_masks)
             pred_ratio = pred_energy / (pred_energy.sum(dim=2, keepdim=True) + 1e-12)
@@ -583,10 +686,6 @@ def save_regression_diagnostics(
 
 
 def build_uniform_fractions(n: int, *, include_endpoints: bool = False) -> tuple[float, ...]:
-    """
-    n: 你希望在(0,1)之间取多少个点
-    include_endpoints=False -> 只取内部点：1/(n+1), 2/(n+1), ..., n/(n+1)
-    """
     if n <= 0:
         return ()
     if include_endpoints:
@@ -725,9 +824,10 @@ print("roi_masks:", tuple(roi_masks.shape))
 
 
 # ----------------------------
-# Build training & test datasets (label is y_vec)
+# ✅ CHANGED: Build training & test datasets (标签按波长不同)
+# 函数签名增加 num_layers_current 参数
 # ----------------------------
-def build_eigenmode_dataset() -> tuple[TensorDataset, TensorDataset, dict]:
+def build_eigenmode_dataset(num_layers_current: int) -> tuple[TensorDataset, TensorDataset, dict]:
     if phase_option == 4:
         num_samples = num_modes
         amplitudes = base_amplitudes[:num_samples]
@@ -737,8 +837,22 @@ def build_eigenmode_dataset() -> tuple[TensorDataset, TensorDataset, dict]:
         phases = base_phases
         num_samples = amplitudes.shape[0]
 
-    y_vec = amplitudes_to_yvec(amplitudes)                 # (N,M)
-    y_vec = y_vec[:, None, :].repeat(1, L, 1).contiguous() # (N,L,M)
+    # ✅ 计算总自由空间传播距离
+    z_total = z_input_to_first + (num_layers_current - 1) * z_layers + z_prop
+    print(f"  [eigenmode] z_total for {num_layers_current} layers: {z_total*1e6:.1f} μm")
+
+    # ✅ 为每个波长生成物理真实标签（替换旧的 amplitudes_to_yvec + repeat）
+    y_vec = compute_per_wavelength_labels(
+        amplitudes=amplitudes,
+        mmf_modes=MMF_data_ts,
+        wls=wavelengths,
+        masks=roi_masks,
+        ls=layer_size,
+        px=pixel_size,
+        z_tot=z_total,
+        dev=device,
+        pad_ratio=padding_ratio,
+    )  # (N, L, M)
 
     complex_weights = amplitudes * np.exp(1j * phases)
     complex_weights_ts = torch.from_numpy(complex_weights.astype(np.complex64))
@@ -751,14 +865,18 @@ def build_eigenmode_dataset() -> tuple[TensorDataset, TensorDataset, dict]:
     for i in range(num_samples):
         img_i, _ = prepare_sample(image_data[i], dummy_label, layer_size)
         images_prepared.append(img_i)
-    image_tensor = torch.stack(images_prepared, dim=0)  # (N,1,H,W) complex
+    image_tensor = torch.stack(images_prepared, dim=0)
 
     ds = TensorDataset(image_tensor, y_vec)
     meta = {"amplitudes": amplitudes, "phases": phases}
     return ds, ds, meta
 
 
-def build_superposition_dataset(num_samples: int, rng_seed: int) -> tuple[TensorDataset, dict]:
+def build_superposition_dataset(
+    num_samples: int,
+    rng_seed: int,
+    num_layers_current: int,
+) -> tuple[TensorDataset, dict]:
     ctx = build_superposition_eval_context(
         num_samples,
         num_modes=num_modes,
@@ -771,56 +889,89 @@ def build_superposition_dataset(num_samples: int, rng_seed: int) -> tuple[Tensor
         rng_seed=rng_seed,
     )
     tensor_dataset: TensorDataset = ctx["tensor_dataset"]
-    images = tensor_dataset.tensors[0]         # (N,1,H,W) complex
-    amplitudes = ctx["amplitudes"]             # (N,M) numpy
-    phases = ctx["phases"]                     # (N,M) numpy
+    images = tensor_dataset.tensors[0]
+    amplitudes = ctx["amplitudes"]
+    phases = ctx["phases"]
 
-    y_vec = amplitudes_to_yvec(amplitudes)                 # (N,M)
-    y_vec = y_vec[:, None, :].repeat(1, L, 1).contiguous() # (N,L,M)
+    # ✅ 计算总自由空间传播距离
+    z_total = z_input_to_first + (num_layers_current - 1) * z_layers + z_prop
+    print(f"  [superposition] z_total for {num_layers_current} layers: {z_total*1e6:.1f} μm")
+
+    # ✅ 为每个波长生成物理真实标签
+    y_vec = compute_per_wavelength_labels(
+        amplitudes=amplitudes,
+        mmf_modes=MMF_data_ts,
+        wls=wavelengths,
+        masks=roi_masks,
+        ls=layer_size,
+        px=pixel_size,
+        z_tot=z_total,
+        dev=device,
+        pad_ratio=padding_ratio,
+    )  # (N, L, M)
 
     ds = TensorDataset(images, y_vec)
     meta = {"amplitudes": amplitudes, "phases": phases}
     return ds, meta
 
 
-if training_dataset_mode == "eigenmode":
-    train_ds, _, train_meta = build_eigenmode_dataset()
-elif training_dataset_mode == "superposition":
-    train_ds, train_meta = build_superposition_dataset(num_superposition_train_samples, superposition_train_seed)
-else:
-    raise ValueError(f"Unknown training_dataset_mode: {training_dataset_mode}")
+# ============================================================
+# ✅ CHANGED: 数据集构建移入循环内部（删除了循环外的构建代码）
+# ============================================================
 
-if evaluation_mode == "eigenmode":
-    test_ds, _, test_meta = build_eigenmode_dataset()
-elif evaluation_mode == "superposition":
-    test_ds, test_meta = build_superposition_dataset(num_superposition_eval_samples, superposition_eval_seed)
-else:
-    raise ValueError(f"Unknown evaluation_mode: {evaluation_mode}")
-
-
-# ----------------------------
-# Dataloaders
-# ----------------------------
-g = torch.Generator()
-g.manual_seed(SEED)
-
-train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, generator=g)
-test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
-
-print("train images:", tuple(train_ds.tensors[0].shape), train_ds.tensors[0].dtype)
-print("train labels:", tuple(train_ds.tensors[1].shape), train_ds.tensors[1].dtype)
-print("test  images:", tuple(test_ds.tensors[0].shape), test_ds.tensors[0].dtype)
-print("test  labels:", tuple(test_ds.tensors[1].shape), test_ds.tensors[1].dtype)
-
-
-# ----------------------------
-# Train & evaluate models
-# ----------------------------
 all_training_summaries: list[dict] = []
 model_metrics: list[dict] = []
 
 for num_layer in num_layer_option:
-    print(f"\nTraining D2NNModelMultiWL with {num_layer} layers...\n")
+    print(f"\n{'='*60}")
+    print(f"Training D2NNModelMultiWL with {num_layer} layers...")
+    print(f"{'='*60}\n")
+
+    # ✅ 每个层数重新构建数据集（z_total 不同 → 标签不同）
+    if training_dataset_mode == "eigenmode":
+        train_ds, _, train_meta = build_eigenmode_dataset(
+            num_layers_current=num_layer
+        )
+    elif training_dataset_mode == "superposition":
+        train_ds, train_meta = build_superposition_dataset(
+            num_superposition_train_samples,
+            superposition_train_seed,
+            num_layers_current=num_layer,
+        )
+    else:
+        raise ValueError(f"Unknown training_dataset_mode: {training_dataset_mode}")
+
+    if evaluation_mode == "eigenmode":
+        test_ds, _, test_meta = build_eigenmode_dataset(
+            num_layers_current=num_layer
+        )
+    elif evaluation_mode == "superposition":
+        test_ds, test_meta = build_superposition_dataset(
+            num_superposition_eval_samples,
+            superposition_eval_seed,
+            num_layers_current=num_layer,
+        )
+    else:
+        raise ValueError(f"Unknown evaluation_mode: {evaluation_mode}")
+
+    # 重建 dataloader
+    g = torch.Generator()
+    g.manual_seed(SEED)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, generator=g)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+
+    print("train images:", tuple(train_ds.tensors[0].shape), train_ds.tensors[0].dtype)
+    print("train labels:", tuple(train_ds.tensors[1].shape), train_ds.tensors[1].dtype)
+    print("test  images:", tuple(test_ds.tensors[0].shape), test_ds.tensors[0].dtype)
+    print("test  labels:", tuple(test_ds.tensors[1].shape), test_ds.tensors[1].dtype)
+
+    # ✅ debug: 确认不同波长标签确实不同
+    print("\n  Label check (sample 0):")
+    for li in range(L):
+        wl_nm = wavelengths[li] * 1e9
+        print(f"    λ={wl_nm:.1f}nm: {train_ds.tensors[1][0, li].numpy().round(4)}")
+
+    # ---- 后续代码完全不变 ----
 
     model = D2NNModelMultiWL(
         num_layers=num_layer,
@@ -849,9 +1000,9 @@ for num_layer in num_layer_option:
     with torch.no_grad():
         images0, y0 = next(iter(train_loader))
         images0 = images0.to(device, dtype=torch.complex64)
-        x0 = images0.repeat(1, L, 1, 1).contiguous()  # (B,L,H,W)
-        I0 = model(x0)                                # (B,L,H,W)
-        pred0 = intensity_to_roi_energies(I0, roi_masks)  # (B,L,M)
+        x0 = images0.repeat(1, L, 1, 1).contiguous()
+        I0 = model(x0)
+        pred0 = intensity_to_roi_energies(I0, roi_masks)
         print(
             "Sanity check x:", tuple(x0.shape), x0.dtype,
             "| y:", tuple(y0.shape), y0.dtype,
@@ -865,15 +1016,15 @@ for num_layer in num_layer_option:
         epoch_loss = 0.0
 
         for images, y in train_loader:
-            images = images.to(device, dtype=torch.complex64, non_blocking=True)  # (B,1,H,W)
-            y = y.to(device, dtype=torch.float32, non_blocking=True)              # (B,L,M)
+            images = images.to(device, dtype=torch.complex64, non_blocking=True)
+            y = y.to(device, dtype=torch.float32, non_blocking=True)
 
-            x = images.repeat(1, L, 1, 1).contiguous()                            # (B,L,H,W)
+            x = images.repeat(1, L, 1, 1).contiguous()
 
             optimizer.zero_grad(set_to_none=True)
 
-            I_blhw = model(x)                                                     # (B,L,H,W)
-            pred_energy = intensity_to_roi_energies(I_blhw, roi_masks)            # (B,L,M)
+            I_blhw = model(x)
+            pred_energy = intensity_to_roi_energies(I_blhw, roi_masks)
             pred_ratio  = pred_energy / (pred_energy.sum(dim=2, keepdim=True) + 1e-12)
 
             loss = F.mse_loss(pred_ratio, y)
@@ -984,14 +1135,13 @@ for num_layer in num_layer_option:
     print("✔ Saved model ->", save_path)
 
     # ----------------------------
-    # Export phase masks (one-shot) + grids (phi0 grid + wavelength×layer grid)
+    # Export phase masks
     # ----------------------------
     phase_dir = Path("results/phase_masks_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     phase_dir.mkdir(parents=True, exist_ok=True)
 
     tag = f"multiwl_L{num_layer}_m{num_modes}_ls{layer_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-    # 1) 一次性导出：phi0、scaled-by-lambda、以及可视化 wrap 的 *_vis
     export_info = export_phase_masks_multiwl_per_wavelength(
         model,
         out_dir=phase_dir,
@@ -1003,37 +1153,31 @@ for num_layer in num_layer_option:
         cmap="twilight",
     )
 
-    # 2) 直接从导出的 npz 读数据来画拼图（避免重复从 model.layers 再抽一次）
     data = np.load(export_info["npz_path"])
-    phase_phi0_vis = data["phase_phi0_vis"]                       # (N_layers,H,W) 已 wrap 到 0..2pi
-    phase_scaled_vis = data["phase_scaled_by_lambda_vis"]         # (N_layers,L,H,W) 已 wrap 到 0..2pi
-    wls_m = data["wavelengths_m"]                                 # (L,)
+    phase_phi0_vis = data["phase_phi0_vis"]
+    phase_scaled_vis = data["phase_scaled_by_lambda_vis"]
+    wls_m = data["wavelengths_m"]
 
-    # 2a) 画：按层排列（phi0）
     save_phase_masks_grid_png(
         phase_phi0_vis,
         save_path=phase_dir / f"grid_phi0_layers{num_layer}_{tag}.png",
         title=f"Phase Masks (phi0) - {num_layer} Layers",
         cmap="hsv",
-        wrap_to_2pi=False,   # 因为已经是 *_vis（0..2pi），不要重复 wrap
+        wrap_to_2pi=False,
         dpi=300,
     )
 
-    # 2b) 画：行=波长、列=层（scaled-by-lambda）
     save_phase_masks_grid_wl_x_layer_png(
         phase_scaled_vis,
         wls_m,
         save_path=phase_dir / f"grid_wavelength_x_layer_layers{num_layer}_{tag}.png",
         title=f"Phase Masks - {num_layer} Layers (rows=λ, cols=layer)",
         cmap="hsv",
-        wrapped=True,        # *_vis 已经是 0..2pi
+        wrapped=True,
         dpi=300,
     )
 
     print(f"✔ Phase export + grids saved -> {phase_dir}")
-
-
-
 
     # ============================================================
     # Export MultiWL propagation slices + key snapshots
@@ -1045,7 +1189,7 @@ for num_layer in num_layer_option:
         else:
             sample_idx = int(slice_fixed_index) % len(test_ds)
 
-        input_E_1hw = test_ds.tensors[0][sample_idx].to(device, dtype=torch.complex64)  # (1,H,W)
+        input_E_1hw = test_ds.tensors[0][sample_idx].to(device, dtype=torch.complex64)
 
         slices_dir = Path("results/propagation_slices_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         scans, camera_field = visualize_model_slices_multiwl(
@@ -1069,7 +1213,7 @@ for num_layer in num_layer_option:
         snap_dir = Path("results/propagation_snapshots_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         eigenmode_index = min(2, MMF_data_ts.shape[0] - 1)
 
-        fractions_per_segment = 25  # ✅ 越大越密，20/25/40 都行
+        fractions_per_segment = 25
         dense = np.linspace(
             1.0 / (fractions_per_segment + 1),
             fractions_per_segment / (fractions_per_segment + 1),
@@ -1095,8 +1239,8 @@ for num_layer in num_layer_option:
             output_dir=snap_dir,
             tag=f"multiwl_L{num_layer}",
             base_wavelength_idx=int(base_wavelength_idx),
-            fractions_between_layers=fractions_between_layers,  # ✅ NEW
-            output_fractions=output_fractions,                  # ✅ NEW
+            fractions_between_layers=fractions_between_layers,
+            output_fractions=output_fractions,
         )
         print(f"✔ Saved MultiWL snapshots -> {summary['fig_path']}")
         print(f"✔ Saved MultiWL snapshots MAT -> {summary['mat_path']}")
