@@ -105,7 +105,7 @@ z_prop = 120e-6
 z_input_to_first = 40e-6
 
 # ✅ 多波长
-wavelengths = np.array([1330e-9, 1568e-9, 1900e-9], dtype=np.float32)
+wavelengths = np.array([650-9, 1568e-9, 1900e-9], dtype=np.float32)
 base_wavelength_idx = 1
 L = len(wavelengths)
 
