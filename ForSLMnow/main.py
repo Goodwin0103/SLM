@@ -10,7 +10,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, Circle
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import numpy as np
 import torch
 import torch.nn as nn
@@ -110,7 +109,7 @@ save_superposition_slices = True
 run_misalignment_robustness = True
 label_pattern_mode = "mixed"  # options: "eigenmode", "circle", "mixed"
 # Use when label_pattern_mode == "mixed" to assign different shapes per detector.
-detector_shapes = ["square", "plus", "ring"]
+detector_shapes = ["plus", "ring", "plus"]
 superposition_eval_seed = 20240116   # 控制 superposition 测试集的随机性
 show_detection_overlap_debug = True
 detection_overlap_label_index = 0
@@ -121,13 +120,12 @@ debug_wavelengths_nm = [1500.0, 1568.0, 1650.0]
 debug_modes_to_plot = [0, 1]  # 0-based indices
 
 #看过程切片的参数设置
-prop_slices_per_segment = 10   # 每段传播取样张数（层间/输出）
-prop_output_slices = 10        # 输出面前的采样张数
-prop_scan_kmax = 10            # visualize_model_slices 每段最多展示的帧数
+prop_slices_per_segment = 3   # 每段传播取样张数（层间/输出）
+prop_output_slices = 3        # 输出面前的采样张数
+prop_scan_kmax = 3
+            # visualize_model_slices 每段最多展示的帧数
 prop_slice_sample_mode = "random"  # "fixed" 使用 FIXED_E_INDEX，下方可选随机样本
 prop_slice_seed = 20251121         # 控制随机选样的种子
-
-
 
 # Training data selection: 默认用 eigenmode，也可以改成 superposition 并设定样本数量
 training_dataset_mode = "eigenmode"  # options: "eigenmode", "superposition"
@@ -135,7 +133,7 @@ num_superposition_train_samples = 100  # superposition 训练样本数
 superposition_train_seed = 20240115  # 控制 superposition 训练集的随机性
 
 # Define multiple D2NN models 
-num_layer_option = [2]   # Define the different layer-number ODNN
+num_layer_option = [1, 2, 3 ,4 ,5]   # Define the different layer-number ODNN
 all_losses = [] #the loss for each epoch of each ODNN model
 all_phase_masks = [] #the phase masks field of each ODNN model
 all_predictions = [] #the output light field of each ODNN model
@@ -339,7 +337,10 @@ if training_dataset_mode == "eigenmode":
         energy_weights[:, None, None, :] * MMF_Label_data.unsqueeze(0)
     ).sum(dim=3)    #重点用的是：能量去乘基本的模
     label_data[:, 0, :, :] = combined_labels
-
+    # 🔍 调试：打印每个样本的标签峰值
+    for i in range(num_train_samples):
+        peak_val = label_data[i, 0].max().item()
+        print(f"  Sample {i+1} 标签峰值: {peak_val:.4f}")
     complex_weights = amplitudes * np.exp(1j * phases) #生成输出的逻辑不变还是用amp哈
     complex_weights_ts = torch.from_numpy(complex_weights.astype(np.complex64))
     image_data = generate_fields_ts(
@@ -397,6 +398,9 @@ if evaluation_mode == "eigenmode":
     eval_amplitudes_phases = amplitudes_phases
     eval_phases = phases
     image_test_data = image_data
+    print("🔍 Eigenmode 测试集标签（前3个样本）:")
+    for i in range(min(3, len(eval_amplitudes))):
+        print(f"  Sample {i+1}: {eval_amplitudes[i]}")
 elif evaluation_mode == "superposition":
     if pred_case != 1:
         raise ValueError("Superposition evaluation mode currently supports pred_case == 1 only.")
@@ -626,7 +630,6 @@ def run_experiment_for_layer_size(
             energy_weights[:, None, None, :] * MMF_Label_data.unsqueeze(0)
         ).sum(dim=3)
         label_data[:, 0, :, :] = combined_labels
-
         complex_weights = amplitudes * np.exp(1j * phases)
         complex_weights_ts = torch.from_numpy(complex_weights.astype(np.complex64))
         image_data = generate_fields_ts(

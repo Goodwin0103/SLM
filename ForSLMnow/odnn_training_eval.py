@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from matplotlib.patches import Circle
 
@@ -28,7 +29,6 @@ def build_circular_roi_masks(
     radius = int(round(focus_radius * radius_scale))
     if generator is None:
         from ODNN_functions import create_labels
-
         generator = create_labels
 
     masks = []
@@ -88,13 +88,20 @@ def sample_tensor_slices(tensor: torch.Tensor, kmax: int = 25) -> torch.Tensor:
     return tensor[indices]
 
 
+# =========================
+# ROI mask helpers (FIXED)
+# =========================
 def _circle_masks_from_regions(
     shape: Tuple[int, int],
     evaluation_regions: Sequence[Tuple[int, int, int, int]],
     radius: int,
     offset: Tuple[int, int] = (0, 0),
 ) -> list[np.ndarray]:
-    height, width = shape
+    """
+    Build list of 2D boolean masks (H,W).
+    shape can be (H,W), (B,H,W), (B,1,H,W) etc.
+    """
+    height, width = int(shape[-2]), int(shape[-1])
     yy, xx = np.ogrid[:height, :width]
     off_x, off_y = offset
 
@@ -107,14 +114,37 @@ def _circle_masks_from_regions(
     return masks
 
 
-def sum_signal_energy_circle(
-    intensity: np.ndarray,
-    evaluation_regions: Sequence[Tuple[int, int, int, int]],
-    radius: int,
-    offset: Tuple[int, int] = (0, 0),
-) -> float:
-    masks = _circle_masks_from_regions(intensity.shape, evaluation_regions, radius, offset)
-    return float(sum(intensity[mask].sum() for mask in masks))
+def sum_signal_energy_circle(intensity, evaluation_regions, radius, offset=(0, 0)):
+    """
+    Supports:
+      - (H, W)
+      - (B, H, W)
+      - (B, 1, H, W)
+
+    Returns:
+      - float: summed energy over all detectors AND all batch samples
+    """
+    arr = np.asarray(intensity)
+
+    # squeeze channel dim if present: (B,1,H,W) -> (B,H,W)
+    if arr.ndim == 4 and arr.shape[1] == 1:
+        arr = arr[:, 0, :, :]
+
+    if arr.ndim == 2:
+        H, W = int(arr.shape[-2]), int(arr.shape[-1])
+        masks = _circle_masks_from_regions((H, W), evaluation_regions, radius, offset)
+        return float(sum(arr[mask].sum() for mask in masks))
+
+    if arr.ndim == 3:
+        B, H, W = arr.shape
+        masks = _circle_masks_from_regions((H, W), evaluation_regions, radius, offset)
+        total = 0.0
+        for b in range(B):
+            Ib = arr[b]
+            total += sum(Ib[mask].sum() for mask in masks)
+        return float(total)
+
+    raise ValueError(f"Unsupported intensity shape: {arr.shape}")
 
 
 def spot_energy_ratios_circle(
@@ -124,11 +154,94 @@ def spot_energy_ratios_circle(
     offset: Tuple[int, int] = (0, 0),
     eps: float = 1e-12,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    masks = _circle_masks_from_regions(intensity.shape, evaluation_regions, radius, offset)
-    energies = np.array([float(intensity[mask].sum()) for mask in masks], dtype=np.float64)
-    total = float(intensity.sum()) + eps
+    """
+    IMPORTANT:
+      - This function expects a SINGLE 2D map (H,W).
+      - If you have batch, index it first: intensity = intensity[b] or intensity[b,0]
+    """
+    arr = np.asarray(intensity)
+
+    # squeeze channel dim if present: (1,H,W) -> (H,W)
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        arr = arr[0]
+
+    if arr.ndim != 2:
+        raise ValueError(f"spot_energy_ratios_circle expects 2D (H,W), got {arr.shape}")
+
+    masks = _circle_masks_from_regions(arr.shape, evaluation_regions, radius, offset)
+    energies = np.array([float(arr[mask].sum()) for mask in masks], dtype=np.float64)
+    total = float(arr.sum()) + eps
     ratios = energies / total
     return energies, ratios
+
+import torch
+
+
+@torch.no_grad()
+def _make_circle_mask(h: int, w: int, r: float, device: torch.device) -> torch.Tensor:
+    yy, xx = torch.meshgrid(
+        torch.arange(h, device=device),
+        torch.arange(w, device=device),
+        indexing="ij",
+    )
+    cy = (h - 1) / 2.0
+    cx = (w - 1) / 2.0
+    return (((yy - cy) ** 2 + (xx - cx) ** 2) <= (r ** 2)).to(torch.float32)
+
+
+@torch.no_grad()
+def region_energies_circle(
+    I_bhw: torch.Tensor,  # (B, H, W) float
+    evaluation_regions: list[tuple[int, int, int, int]],
+    detect_radius: int,
+) -> torch.Tensor:
+    """
+    返回每个 ROI 的“绝对能量”(不归一化): (B, M)
+    ROI 内用圆形 mask 积分（与你现有 detect_radius 口径一致）。
+    """
+    B, H, W = I_bhw.shape
+    M = len(evaluation_regions)
+    out = torch.zeros((B, M), device=I_bhw.device, dtype=torch.float32)
+
+    for mi, (x0, x1, y0, y1) in enumerate(evaluation_regions):
+        patch = I_bhw[:, y0:y1, x0:x1]
+        hh, ww = patch.shape[-2], patch.shape[-1]
+        cmask = _make_circle_mask(hh, ww, float(detect_radius), device=I_bhw.device)
+        out[:, mi] = (patch * cmask.unsqueeze(0)).sum(dim=(-1, -2))
+
+    return out
+
+
+@torch.no_grad()
+def wavelength_energy_ratios_in_det(
+    I_blhw: torch.Tensor,  # (B, L, H, W)
+    evaluation_regions: list[tuple[int, int, int, int]],
+    detect_radius: int,
+    *,
+    L: int,
+    num_modes: int,
+) -> torch.Tensor:
+    """
+    波长间能量比例（仅统计“所有模式检测 ROI”内的能量）:
+      1) 每个波长：把该波长对应的 num_modes 个 ROI 能量求和 -> E_det[:, wl]
+      2) 在波长维归一化 -> p_wl (B, L)
+
+    evaluation_regions 的索引约定需与你主脚本一致：
+      label_idx = mode_k * L + wl_idx
+    """
+    B, Lloc, H, W = I_blhw.shape
+    if Lloc != L:
+        raise ValueError(f"I_blhw has L={Lloc}, but expected L={L}")
+
+    E_det = torch.zeros((B, L), device=I_blhw.device, dtype=torch.float32)
+
+    for wl_idx in range(L):
+        wl_regions = [evaluation_regions[k * L + wl_idx] for k in range(num_modes)]
+        E_k = region_energies_circle(I_blhw[:, wl_idx].to(torch.float32), wl_regions, detect_radius)
+        E_det[:, wl_idx] = E_k.sum(dim=1)
+
+    p_wl = E_det / (E_det.sum(dim=1, keepdim=True) + 1e-12)
+    return p_wl
 
 
 def build_superposition_eval_context(
@@ -174,13 +287,14 @@ def build_superposition_eval_context(
     else:
         phases = np.random.rand(num_samples, num_modes).astype(np.float32) * 2 * np.pi
 
-    phases[:, 0] = 0.0  # enforce deterministic global phase reference
+    phases[:, 0] = 0.0
     if second_mode_half_range and num_modes >= 2:
         if local_rng is not None:
             phases[:, 1] = local_rng.random(num_samples, dtype=np.float32) * np.pi
         else:
             phases[:, 1] = np.random.rand(num_samples).astype(np.float32) * np.pi
     phases[:, 0] = 0.0
+
     complex_weights = amplitudes * np.exp(1j * phases)
 
     complex_weights_ts = torch.from_numpy(complex_weights.astype(np.complex64))
@@ -189,7 +303,7 @@ def build_superposition_eval_context(
     ).to(torch.complex64)
 
     amp_ts = torch.from_numpy(amplitudes.astype(np.float32))
-    amp_ts_energy = amp_ts ** 2  # 标签改为能量/强度
+    amp_ts_energy = amp_ts ** 2
     label_maps = torch.tensordot(amp_ts_energy, mmf_label_data, dims=([1], [2])).to(torch.float32)
     label_maps = label_maps.unsqueeze(1)  # (N, 1, H, W)
 
@@ -241,7 +355,7 @@ def generate_superposition_sample(
     field_small = generate_fields_ts(weights_ts, mmf_modes, 1, num_modes, field_size)[0].detach().cpu()
 
     amp_ts = torch.from_numpy(amplitudes.astype(np.float32))
-    label_map = (mmf_label_data * (amp_ts**2).view(1, 1, -1)).sum(dim=2)  # 标签用能量权重
+    label_map = (mmf_label_data * (amp_ts**2).view(1, 1, -1)).sum(dim=2)
     label_tensor = label_map.unsqueeze(0)
 
     padded_image, padded_label = prepare_sample(field_small, label_tensor, layer_size)
@@ -311,6 +425,9 @@ def save_prediction_diagnostics(
 
         with torch.no_grad():
             pred = model(image_batch)
+
+        # NOTE: if model returns (B,L,H,W), this will NOT work as-is.
+        # Keep your diagnostics for single-wavelength use or adapt similarly to evaluation.
         pred_map = pred[0, 0].detach().cpu().numpy()
 
         def region_energy(arr: np.ndarray) -> np.ndarray:
@@ -421,6 +538,7 @@ def compute_amp_relative_error_with_shift(
             preds = model(shifted_images)
             preds_np = preds.detach().cpu().numpy()
 
+            # NOTE: this assumes preds are (B,1,H,W). If you use MultiWL here, adapt similarly.
             for sample_idx in range(preds_np.shape[0]):
                 intensity_map = preds_np[sample_idx, 0]
                 weights = []
@@ -451,14 +569,17 @@ def compute_amp_relative_error_with_shift(
         field_size,
         image_test_data,
     )
-
     return metrics
 
 
+# ==========================================================
+# forward_full_intensity: original single-wavelength ODNN
+# ==========================================================
 def forward_full_intensity(model: torch.nn.Module, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Propagate inputs through the ODNN with padding retained to produce both cropped and
     full-field intensities.
+    Assumes a single-wavelength ODNN-style model (layers have 2D phase, propagation uses 2D).
     """
     if not inputs.is_complex():
         raise ValueError("inputs must be complex64/complex128 tensors.")
@@ -467,19 +588,16 @@ def forward_full_intensity(model: torch.nn.Module, inputs: torch.Tensor) -> Tupl
     batch, _, height, width = inputs.shape
     pad = int(model.propagation.pad_px)
 
-    # Pad to match propagation canvas
     padded = complex_pad(inputs.squeeze(1), pad, pad)
 
-    # Optional pre-propagation
     if hasattr(model, "pre_propagation") and model.pre_propagation is not None:
         pre = model.pre_propagation
         padded = pre._propagate(padded, pre.kz_pad, pre.z)
 
-    # Diffraction layers on padded canvas
     for layer in model.layers:
         phase = torch.exp(1j * layer.phase.to(device, dtype=torch.float32)).to(torch.complex64)
         phase_big = torch.ones(height + 2 * pad, width + 2 * pad, dtype=torch.complex64, device=device)
-        phase_big[pad : pad + height, pad : pad + width] = phase
+        phase_big[pad:pad + height, pad:pad + width] = phase
         padded = padded * phase_big
         padded = layer._propagate(padded, layer.kz_pad, layer.z)
 
@@ -493,13 +611,70 @@ def forward_full_intensity(model: torch.nn.Module, inputs: torch.Tensor) -> Tupl
     return intensity_cropped, intensity_full
 
 
+# ==========================================================
+# forward_full_intensity_multiwl: NEW for multi-wavelength
+# ==========================================================
+def forward_full_intensity_multiwl(
+    model: torch.nn.Module,
+    inputs: torch.Tensor,
+    *,
+    wavelength_idx: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Multi-wavelength compatible forward.
+
+    inputs: (B,1,H,W) complex
+    model:  expects forward((B,L,H,W) complex) -> (B,L,H,W) float intensity
+
+    returns:
+      - intensity_cropped: (B,1,H,W) float
+      - intensity_full:    (B,1,H+2p,W+2p) float
+        (constructed by placing cropped intensity into center; outside=0)
+    """
+    if not inputs.is_complex():
+        raise ValueError("inputs must be complex64/complex128 tensors.")
+
+    B, C, H, W = inputs.shape
+    if C != 1:
+        raise ValueError(f"Expected inputs (B,1,H,W), got {tuple(inputs.shape)}")
+
+    pad = int(model.propagation.pad_px)
+
+    # infer L
+    if hasattr(model, "propagation") and hasattr(model.propagation, "wavelengths"):
+        L = int(model.propagation.wavelengths.numel())
+    elif hasattr(model, "wavelengths"):
+        L = int(model.wavelengths.numel())
+    else:
+        raise AttributeError("Cannot infer number of wavelengths L from model.")
+
+    wl_idx = int(wavelength_idx)
+    if not (0 <= wl_idx < L):
+        raise ValueError(f"wavelength_idx={wl_idx} out of range for L={L}")
+
+    x = inputs.repeat(1, L, 1, 1).contiguous()  # (B,L,H,W)
+
+    with torch.no_grad():
+        I_all = model(x)  # (B,L,H,W)
+
+    if I_all.ndim != 4:
+        raise ValueError(f"MultiWL model output must be (B,L,H,W), got {tuple(I_all.shape)}")
+
+    I_crop = I_all[:, wl_idx:wl_idx + 1, :, :].contiguous()  # (B,1,H,W)
+
+    I_full = torch.zeros((B, 1, H + 2 * pad, W + 2 * pad), dtype=I_crop.dtype, device=I_crop.device)
+    I_full[:, :, pad:pad + H, pad:pad + W] = I_crop
+
+    return I_crop, I_full
+
+
 def build_roi_masks_with_centers(
     shape: Tuple[int, int],
     evaluation_regions: Sequence[Tuple[int, int, int, int]],
     radius: int,
     center_offset: Tuple[int, int] = (0, 0),
 ) -> Tuple[np.ndarray, np.ndarray, list[Tuple[int, int]]]:
-    height, width = shape
+    height, width = int(shape[-2]), int(shape[-1])
     yy, xx = np.ogrid[:height, :width]
     off_x, off_y = center_offset
 
@@ -625,7 +800,6 @@ def compute_model_prediction_metrics(
             "cc_imag": np.array([], dtype=np.float64),
         }
 
-    # Target amplitudes
     if phase_option == 4:
         target_amp = amplitudes[:num_samples, :num_modes]
         phase_reference = phases[:num_samples, :num_modes]
@@ -633,16 +807,15 @@ def compute_model_prediction_metrics(
         target_amp = amplitudes_phases[:num_samples, :num_modes]
         phase_reference = phases[:num_samples, :num_modes]
 
-    # 能量占比 -> 幅度占比（预测端开方）保持与标签幅度比对
     target_energy = np.square(target_amp, dtype=np.float64)
-    target_energy = target_energy / (np.sum(target_energy, axis=1, keepdims=True) + 1e-12) #双保险归一化一下
-    # amp_target = np.sqrt(np.clip(target_energy, 0.0, None)) # 都行你用energy去算也行，你之前用amp也行
+    target_energy = target_energy / (np.sum(target_energy, axis=1, keepdims=True) + 1e-12)
+
     pred_energy = weights_array
     pred_energy = pred_energy / (np.sum(pred_energy, axis=1, keepdims=True) + 1e-12)
-    amp_pred = np.sqrt(np.clip(pred_energy, 0.0, None))  
-    
-    amp_target = l2_normalize_rows(target_amp.astype(np.float64)) #双保险一下归一化
-    normalized_weights = amp_pred  # 保持接口兼容，返回预测幅度占比
+    amp_pred = np.sqrt(np.clip(pred_energy, 0.0, None))
+
+    amp_target = l2_normalize_rows(target_amp.astype(np.float64))
+    normalized_weights = amp_pred
 
     amplitudes_diff = np.abs(amp_target - amp_pred)
     avg_amp_err = float(np.mean(amplitudes_diff))
@@ -713,6 +886,9 @@ def evaluate_spot_metrics(
 ) -> Dict[str, np.ndarray | float]:
     """
     Evaluate spot energy ratios and reconstruction metrics for a trained model.
+    Compatible with:
+      - single-wavelength ODNN models
+      - multi-wavelength models (uses wavelength_idx=0 by default)
     """
     model.eval()
     eps = 1e-12
@@ -728,29 +904,42 @@ def evaluate_spot_metrics(
     for images, _ in test_loader:
         images = images.to(device, dtype=torch.complex64, non_blocking=True)
 
-        I_crop_t, I_big_t = forward_full_intensity(model, images)
-        I_crop = I_crop_t.detach().cpu().numpy()
-        I_big = I_big_t.detach().cpu().numpy()
+        # ✅ MultiWL branch
+        if hasattr(model, "propagation") and hasattr(model.propagation, "wavelengths"):
+            I_crop_t, I_big_t = forward_full_intensity_multiwl(model, images, wavelength_idx=0)
+        else:
+            I_crop_t, I_big_t = forward_full_intensity(model, images)
+
+        I_crop = I_crop_t.detach().cpu().numpy()  # (B,1,H,W) or (B,H,W) depending on model
+        I_big = I_big_t.detach().cpu().numpy()    # (B,1,H+2p,W+2p) or (B,H+2p,W+2p)
 
         pad = int(model.propagation.pad_px)
 
+        # Normalize shapes to (B,H,W)
+        if I_crop.ndim == 4 and I_crop.shape[1] == 1:
+            I_crop = I_crop[:, 0, :, :]
+        if I_big.ndim == 4 and I_big.shape[1] == 1:
+            I_big = I_big[:, 0, :, :]
+
         for b in range(I_crop.shape[0]):
-            Ic = I_crop[b]
-            Ib = I_big[b]
+            Ic = I_crop[b]  # (H,W)
+            Ib = I_big[b]   # (Hbig,Wbig)
 
             total_full = float(Ib.sum())
             total_crop = float(Ic.sum())
 
             signal_full = sum_signal_energy_circle(Ib, evaluation_regions, r_sig, offset=(pad, pad))
             signal_crop = sum_signal_energy_circle(Ic, evaluation_regions, r_sig, offset=(0, 0))
-            #每个区域占没有裁剪也就是加上padding的整个大图的能量比例，是比例
+
+            # each region energy ratios on full (2D)
             _, ratios_full_vec = spot_energy_ratios_circle(Ib, evaluation_regions, r_sig, offset=(pad, pad), eps=eps)
             ratio_each_full_batch.append(ratios_full_vec)
 
             snr_ratio_full_list.append(signal_full / (total_full + eps))
             snr_ratio_crop_list.append(signal_crop / (total_crop + eps))
             throughput_list.append(total_crop / (total_full + eps))
-            #裁剪后，且只考虑检测那几个区域的能量的能量值
+
+            # weights from cropped (2D)
             masks_crop = _circle_masks_from_regions(Ic.shape, evaluation_regions, r_sig, offset=(0, 0))
             weights = np.asarray([float(Ic[m].sum()) for m in masks_crop], dtype=np.float64)
 
@@ -855,8 +1044,9 @@ def format_metric_report(
     return "\n".join(sections)
 
 
-
-# 用来给多波长但是一个mask用的函数
+# ==========================================================
+# mask shift helpers (keep as your original)
+# ==========================================================
 def _shift_phase_bilinear(phase_2d: torch.Tensor, dx_mm: float, dy_mm: float, pixel_size_m: float) -> torch.Tensor:
     """
     把 2D 相位（弧度）在 x/y 方向平移 (dx_mm, dy_mm)，双线性插值。
@@ -864,18 +1054,21 @@ def _shift_phase_bilinear(phase_2d: torch.Tensor, dx_mm: float, dy_mm: float, pi
     """
     with torch.no_grad():
         device = phase_2d.device
-        H, W   = phase_2d.shape
+        H, W = phase_2d.shape
         dx_pix = (dx_mm * 1e-3) / pixel_size_m
         dy_pix = (dy_mm * 1e-3) / pixel_size_m
         sx = 2.0 * dx_pix / (W - 1)
         sy = 2.0 * dy_pix / (H - 1)
         yy = torch.linspace(-1, 1, H, device=device)
         xx = torch.linspace(-1, 1, W, device=device)
-        gy, gx = torch.meshgrid(yy, xx, indexing='ij')
+        gy, gx = torch.meshgrid(yy, xx, indexing="ij")
         grid = torch.stack([gx - sx, gy - sy], dim=-1)[None]  # (1,H,W,2)
-        out  = F.grid_sample(phase_2d[None,None], grid, mode='bilinear',
-                             padding_mode='zeros', align_corners=True)
-        return out[0,0]
+        out = F.grid_sample(
+            phase_2d[None, None], grid, mode="bilinear",
+            padding_mode="zeros", align_corners=True
+        )
+        return out[0, 0]
+
 
 def apply_shift_to_model_masks(D2NN, dx_mm: float, dy_mm: float, pixel_size_m: float):
     """
@@ -883,17 +1076,250 @@ def apply_shift_to_model_masks(D2NN, dx_mm: float, dy_mm: float, pixel_size_m: f
     """
     originals = []
     for layer in D2NN.layers:
-        # 取出原相位（leaf tensor），clone 一份保存
         p_orig = layer.phase.data.clone()
         originals.append(p_orig)
 
-        # 生成平移后的相位
         p_shift = _shift_phase_bilinear(p_orig, dx_mm, dy_mm, pixel_size_m)
-        layer.phase.data.copy_(p_shift)  
+        layer.phase.data.copy_(p_shift)
 
     return originals
 
-def restore_model_masks(D2NN, originals):
 
+def restore_model_masks(D2NN, originals):
     for layer, p in zip(D2NN.layers, originals):
         layer.phase.data.copy_(p)
+
+def evaluate_spot_metrics_multiwl_each(
+    model: torch.nn.Module,
+    test_loader,
+    evaluation_regions: Sequence[Tuple[int, int, int, int]],
+    *,
+    detect_radius: int,
+    device: torch.device,
+    pred_case: int,
+    num_modes: int,
+    phase_option: int,
+    amplitudes: np.ndarray,
+    amplitudes_phases: np.ndarray,
+    phases: np.ndarray,
+    mmf_modes: torch.Tensor,
+    field_size: int,
+    image_test_data: torch.Tensor,
+) -> Dict[int, Dict[str, np.ndarray | float]]:
+    """
+    Return a metrics dict per wavelength index:
+      {wl_idx: metrics_dict}
+
+    Requires a MultiWL model with model.propagation.wavelengths (or model.wavelengths).
+    """
+    # infer wavelengths list
+    if hasattr(model, "propagation") and hasattr(model.propagation, "wavelengths"):
+        wls = model.propagation.wavelengths.detach().cpu().numpy().astype(np.float64)
+    elif hasattr(model, "wavelengths"):
+        wls = model.wavelengths.detach().cpu().numpy().astype(np.float64)
+    else:
+        raise AttributeError("MultiWL model must expose wavelengths via model.propagation.wavelengths or model.wavelengths")
+
+    L = int(len(wls))
+    results: Dict[int, Dict[str, np.ndarray | float]] = {}
+
+    # run per wavelength by temporarily calling forward_full_intensity_multiwl with different idx
+    # easiest: reuse evaluate_spot_metrics logic, but force wavelength_idx each time.
+    # We do it by monkeypatching a tiny wrapper that looks MultiWL but always returns chosen wl.
+    class _PickWL(torch.nn.Module):
+        def __init__(self, m: torch.nn.Module, wl_idx: int):
+            super().__init__()
+            self.m = m
+            self.wl_idx = int(wl_idx)
+            # keep propagation attr so evaluate_spot_metrics branches to multiwl
+            self.propagation = getattr(m, "propagation", None)
+
+        def forward(self, x_blhw: torch.Tensor) -> torch.Tensor:
+            # x_blhw is (B,L,H,W) complex in multiwl eval path
+            I_all = self.m(x_blhw)  # (B,L,H,W) float
+            return I_all[:, self.wl_idx : self.wl_idx + 1].contiguous()  # (B,1,H,W)
+
+    # NOTE:
+    # - evaluate_spot_metrics() will detect MultiWL by propagation.wavelengths and call forward_full_intensity_multiwl(),
+    #   which repeats inputs to (B,L,H,W) and calls model(x).
+    # - So here we wrap the model so that model(x) returns (B,1,H,W) for the chosen wl,
+    #   and we also make the wrapper still look "multiwl" via .propagation.wavelengths existing.
+    for wl_idx in range(L):
+        picker = _PickWL(model, wl_idx).to(device)
+        picker.eval()
+
+        m = evaluate_spot_metrics(
+            picker,
+            test_loader,
+            evaluation_regions,
+            detect_radius=detect_radius,
+            device=device,
+            pred_case=pred_case,
+            num_modes=num_modes,
+            phase_option=phase_option,
+            amplitudes=amplitudes,
+            amplitudes_phases=amplitudes_phases,
+            phases=phases,
+            mmf_modes=mmf_modes,
+            field_size=field_size,
+            image_test_data=image_test_data,
+        )
+        # attach wavelength value for convenience
+        m = dict(m)
+        m["wavelength_m"] = float(wls[wl_idx])
+        results[int(wl_idx)] = m
+
+    return results
+
+def save_prediction_diagnostics_multiwl_each(
+    model: torch.nn.Module,
+    dataset,
+    *,
+    evaluation_regions,
+    layer_size: int,
+    detect_radius: int,
+    num_samples: int,
+    output_dir: Path,
+    device: torch.device,
+    tag: str,
+    wavelength_indices: Optional[Sequence[int]] = None,
+) -> Dict[int, list[Path]]:
+    """
+    Save per-wavelength diagnostics for a MultiWL model.
+
+    It will save, for each wavelength index:
+      - label map
+      - predicted intensity map (for that wavelength)
+      - abs diff
+      - normalized detector energies (label vs pred)
+
+    Returns:
+      {wl_idx: [list of saved png paths]}
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model.eval()
+
+    # infer wavelengths and L
+    if hasattr(model, "propagation") and hasattr(model.propagation, "wavelengths"):
+        wls = model.propagation.wavelengths.detach().cpu().numpy().astype(np.float64)
+    elif hasattr(model, "wavelengths"):
+        wls = model.wavelengths.detach().cpu().numpy().astype(np.float64)
+    else:
+        raise AttributeError("MultiWL model must expose wavelengths via model.propagation.wavelengths or model.wavelengths")
+
+    L = int(len(wls))
+    if wavelength_indices is None:
+        wl_indices = list(range(L))
+    else:
+        wl_indices = [int(i) for i in wavelength_indices]
+        for i in wl_indices:
+            if i < 0 or i >= L:
+                raise ValueError(f"wavelength index {i} out of range for L={L}")
+
+    sample_indices = list(range(min(num_samples, len(dataset))))
+
+    def _get_sample(dataset_, idx_: int):
+        # same behavior as your helper
+        if isinstance(dataset_, list):
+            return dataset_[idx_]
+        if isinstance(dataset_, TensorDataset):
+            return dataset_.tensors[0][idx_], dataset_.tensors[1][idx_]
+        raise TypeError(f"Unsupported dataset type: {type(dataset_)}")
+
+    def _region_energy(arr2d: np.ndarray) -> np.ndarray:
+        yy, xx = np.ogrid[:arr2d.shape[0], :arr2d.shape[1]]
+        radius_px = max(1, int(round(detect_radius / 2.0)))
+        vals = []
+        for (x0, x1, y0, y1) in evaluation_regions:
+            cx = int(round((x0 + x1) / 2.0))
+            cy = int(round((y0 + y1) / 2.0))
+            mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius_px**2
+            vals.append(float(arr2d[mask].sum()))
+        return np.asarray(vals, dtype=np.float64)
+
+    def _safe_norm(v: np.ndarray) -> np.ndarray:
+        s = float(v.sum())
+        return v / s if s > 0 else v
+
+    saved_paths: Dict[int, list[Path]] = {i: [] for i in wl_indices}
+
+    for sample_idx in sample_indices:
+        image, label = _get_sample(dataset, sample_idx)
+
+        # image: (1,H,W) complex, label: (1,H,W) float
+        image_b1 = image.unsqueeze(0).to(device, dtype=torch.complex64)  # (B=1,1,H,W)
+        label_map = label[0].detach().cpu().numpy()
+
+        # forward multiwl: (1,L,H,W)
+        x_blhw = image_b1.repeat(1, L, 1, 1).contiguous()
+        with torch.no_grad():
+            I_blhw = model(x_blhw)  # (1,L,H,W) float
+
+        I_lhw = I_blhw[0].detach().cpu().numpy()  # (L,H,W)
+
+        # prepare label detector bars once
+        label_weights = _region_energy(label_map)
+        label_norm = _safe_norm(label_weights)
+
+        for wl_idx in wl_indices:
+            pred_map = I_lhw[wl_idx]
+            pred_weights = _region_energy(pred_map)
+            pred_norm = _safe_norm(pred_weights)
+
+            wl_nm = wls[wl_idx] * 1e9
+
+            fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+
+            im0 = axes[0].imshow(label_map, cmap="inferno")
+            axes[0].set_title("Label")
+            axes[0].set_axis_off()
+            fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+            im1 = axes[1].imshow(pred_map, cmap="inferno")
+            axes[1].set_title(f"Prediction (wl_idx={wl_idx}, {wl_nm:.1f} nm)")
+            axes[1].set_axis_off()
+            fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+            diff_map = np.abs(pred_map - label_map)
+            im2 = axes[2].imshow(diff_map, cmap="magma")
+            axes[2].set_title("|Pred - Label|")
+            axes[2].set_axis_off()
+            fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+            radius_px = max(1, int(round(detect_radius / 2.0)))
+            for ax in (axes[0], axes[1], axes[2]):
+                for (x0, x1, y0, y1) in evaluation_regions:
+                    cx = (x0 + x1) / 2.0
+                    cy = (y0 + y1) / 2.0
+                    circ = Circle(
+                        (cx, cy),
+                        radius=radius_px,
+                        linewidth=0.8,
+                        edgecolor="cyan",
+                        facecolor="none",
+                        linestyle=":",
+                        alpha=0.9,
+                    )
+                    ax.add_patch(circ)
+
+            x = np.arange(len(pred_norm))
+            width = 0.35
+            axes[3].bar(x - width / 2, label_norm, width=width, label="Label", color="tab:blue")
+            axes[3].bar(x + width / 2, pred_norm, width=width, label="Pred", color="tab:orange")
+            axes[3].set_xticks(x)
+            axes[3].set_xticklabels([f"M{i+1}" for i in x], rotation=45, ha="right")
+            axes[3].set_ylim(0, 1.05)
+            axes[3].grid(axis="y", alpha=0.3, linestyle="--", linewidth=0.5)
+            axes[3].legend()
+            axes[3].set_title("Normalized detector energies")
+
+            fig.suptitle(f"Sample {sample_idx:03d} | {tag} | wl_idx={wl_idx} ({wl_nm:.1f} nm)", fontsize=12)
+            fig.tight_layout(rect=(0, 0, 1, 0.95))
+
+            out_path = output_dir / f"{tag}_wl{wl_idx:02d}_sample{sample_idx:03d}.png"
+            fig.savefig(out_path, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+
+            saved_paths[int(wl_idx)].append(out_path)
+
+    return saved_paths
