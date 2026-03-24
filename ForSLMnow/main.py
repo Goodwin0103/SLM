@@ -12,14 +12,16 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, Circle
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from scipy.io import savemat
 from torch.optim.lr_scheduler import ExponentialLR
 from torch.utils.data import DataLoader, TensorDataset
-
+import gc
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+gc.collect()
 from ODNN_functions import (
     create_evaluation_regions,
     generate_complex_weights,
@@ -75,7 +77,7 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 torch.use_deterministic_algorithms(True)
 if torch.cuda.is_available():
-    device = torch.device('cuda:5')           # 或者 'cuda:0'
+    device = torch.device('cuda:0')           # 或者 'cuda:0'
     print('Using Device:', device)
 else:
     device = torch.device('cpu')
@@ -108,7 +110,7 @@ save_superposition_slices = True
 run_misalignment_robustness = True
 label_pattern_mode = "mixed"  # options: "eigenmode", "circle", "mixed"
 # Use when label_pattern_mode == "mixed" to assign different shapes per detector.
-detector_shapes = ["circle", "square", "diamond"]
+detector_shapes = ["square", "plus", "ring"]
 superposition_eval_seed = 20240116   # 控制 superposition 测试集的随机性
 show_detection_overlap_debug = True
 detection_overlap_label_index = 0
@@ -212,6 +214,18 @@ eigenmodes_OM4 = load_complex_modes_from_mat(
     key='modes_field'
 )
 print("Loaded modes shape:", eigenmodes_OM4.shape, "dtype:", eigenmodes_OM4.dtype)
+
+H_mode, W_mode = eigenmodes_OM4.shape[0], eigenmodes_OM4.shape[1]
+if H_mode != W_mode:
+    max_dim = max(H_mode, W_mode)
+    padded = np.zeros((max_dim, max_dim, eigenmodes_OM4.shape[2]), dtype=eigenmodes_OM4.dtype)
+    pad_h = (max_dim - H_mode) // 2
+    pad_w = (max_dim - W_mode) // 2
+    padded[pad_h:pad_h + H_mode, pad_w:pad_w + W_mode, :] = eigenmodes_OM4
+    eigenmodes_OM4 = padded
+    print(f"⚠ Non-square modes ({H_mode}×{W_mode}) zero-padded to {max_dim}×{max_dim}")
+print("Final modes shape:", eigenmodes_OM4.shape)
+
 if eigenmodes_OM4.shape[2] < max_modes_needed:
     raise ValueError(
         f"Source modes only provide {eigenmodes_OM4.shape[2]} modes < required {max_modes_needed}."
@@ -222,7 +236,7 @@ MMF_data = mode_context["mmf_data_np"]
 MMF_data_ts = mode_context["mmf_data_ts"]
 base_amplitudes = mode_context["base_amplitudes"]
 base_phases = mode_context["base_phases"]
-loaded_field_size = int(MMF_data_ts.shape[-1])
+loaded_field_size = int(max(MMF_data_ts.shape[-2], MMF_data_ts.shape[-1]))
 if field_size != loaded_field_size:
     print(f"field_size={field_size} does not match mode size {loaded_field_size}; using mode size.")
     field_size = loaded_field_size
@@ -1121,7 +1135,6 @@ for num_layer in num_layer_option:
         D2NN,
         test_loader,
         evaluation_regions,
-        detection_masks=detection_masks,
         detect_radius=detectsize,
         device=device,
         pred_case=pred_case,

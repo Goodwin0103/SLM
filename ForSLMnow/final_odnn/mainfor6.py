@@ -2,6 +2,8 @@
 import json
 import math
 import os
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8' 
+
 import random
 import time
 from datetime import datetime
@@ -75,7 +77,7 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 torch.use_deterministic_algorithms(True)
 if torch.cuda.is_available():
-    device = torch.device('cuda:2')           # 或者 'cuda:0'
+    device = torch.device('cuda:0')           # 或者 'cuda:0'
     print('Using Device:', device)
 else:
     device = torch.device('cpu')
@@ -389,7 +391,7 @@ if pred_case ==1:
     evaluation_regions = create_evaluation_regions(layer_size, layer_size, num_detector, focus_radius, detectsize)
     print("Detection Regions:", evaluation_regions)
     if show_detection_overlap_debug:
-        detection_debug_dir = Path("results/detection_region_debug")
+        detection_debug_dir = Path("detection_region_debug")
         detection_debug_dir.mkdir(parents=True, exist_ok=True)
         overlap_map = np.zeros((layer_size, layer_size), dtype=np.float32)
         for (x0, x1, y0, y1) in evaluation_regions:
@@ -472,7 +474,7 @@ def run_experiment_for_layer_size(
     """
     print(f"\n===== Running experiment for layer_size={layer_size}, num_modes={num_modes} =====")
     viz_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    viz_root = Path("results/prediction_viz") / f"m{num_modes}_ls{layer_size}_{viz_tag}"
+    viz_root = Path("prediction_viz") / f"m{num_modes}_ls{layer_size}_{viz_tag}"
     label_size = layer_size
     focus_radius = circle_focus_radius
     detectsize = circle_detectsize
@@ -727,7 +729,7 @@ def run_experiment_for_layer_size(
 
 #%% D2NN models and train them，考虑多种layersize的可能
 if run_layer_size_sweep:
-    sweep_dir = Path("results/layer_size_sweep")
+    sweep_dir = Path("layer_size_sweep")
     sweep_dir.mkdir(parents=True, exist_ok=True)
     sweep_results = []
     rel_err_matrix = np.full(
@@ -870,7 +872,7 @@ for num_layer in num_layer_option:
         f'(~{total_training_time / 60:.2f} minutes)'
     )
     all_losses.append(losses)  # save the loss for each model
-    training_output_dir = Path("results/training_analysis")
+    training_output_dir = Path("training_analysis")
     training_output_dir.mkdir(parents=True, exist_ok=True)
     epochs_array = np.arange(1, epochs + 1, dtype=np.int32)
     cumulative_epoch_times = np.cumsum(epoch_durations)
@@ -915,7 +917,7 @@ for num_layer in num_layer_option:
     print(f"✔ Saved cumulative time plot -> {time_plot_path}")
     print(f"✔ Saved training log data (.mat) -> {mat_path}")
 
-    propagation_dir = Path("results/propagation_slices")
+    propagation_dir = Path("propagation_slices")
     eigenmode_index = min(2, MMF_data_ts.shape[0] - 1)
     layer_fractions = [build_uniform_fractions(prop_slices_per_segment) for _ in range(num_layer)]
     output_fractions = build_uniform_fractions(prop_output_slices)
@@ -954,7 +956,7 @@ for num_layer in num_layer_option:
 
     mode_triptych_records: list[dict[str, str | int]] = []
     if evaluation_mode == "eigenmode":
-        triptych_dir = Path("results/mode_triptychs")
+        triptych_dir = Path("mode_triptychs")
         mode_tag = f"layers{num_layer}_m{num_modes}_{timestamp_tag}"
         for mode_idx in range(min(num_modes, len(MMF_data_ts))):
             label_tensor = label_data[mode_idx, 0]
@@ -1047,7 +1049,7 @@ for num_layer in num_layer_option:
     )
 
     # Qualitative check: label vs prediction heatmaps + amplitude bars
-    diag_dir = Path("results/prediction_viz") / f"main_L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    diag_dir = Path("prediction_viz") / f"main_L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     diag_paths = save_prediction_diagnostics(
         D2NN,
         test_dataset,
@@ -1090,7 +1092,7 @@ for num_layer in num_layer_option:
 #%% Metrics vs. layer count
 
 if model_metrics:
-    metrics_dir = Path("results/metrics_analysis")
+    metrics_dir = Path("metrics_analysis")
     metrics_dir.mkdir(parents=True, exist_ok=True)
     metrics_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1158,7 +1160,7 @@ if model_metrics:
 
 # #%% Wavelength sweep: relative amplitude error (1550–1700 nm, fixed eval set)
 # if pred_case == 1 and all_phase_masks:
-#     wavelength_sweep_dir = Path("results/wavelength_analysis")
+#     wavelength_sweep_dir = Path("wavelength_analysis")
 #     wavelength_sweep_dir.mkdir(parents=True, exist_ok=True)
 #     sweep_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1257,7 +1259,7 @@ if model_metrics:
 
 # #%% Relative amp error vs. layer count 层和realtiv的曲线
 # if evaluation_mode == "superposition" and all_amplitudes_relative_diff:
-#     rel_err_dir = Path("results/metrics_analysis")
+#     rel_err_dir = Path("metrics_analysis")
 #     rel_err_dir.mkdir(parents=True, exist_ok=True)
 #     rel_err_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1291,7 +1293,7 @@ if model_metrics:
 
 # #%% Mode isolation vs. layer count isolation的图
 # if pred_case == 1 and evaluation_mode == "eigenmode" and all_phase_masks:
-#     isolation_dir = Path("results/layer_isolation_analysis")
+#     isolation_dir = Path("layer_isolation_analysis")
 #     isolation_dir.mkdir(parents=True, exist_ok=True)
 #     isolation_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1469,7 +1471,7 @@ if model_metrics:
 #     and all_phase_masks
 #     and 3 in num_layer_option
 # ):
-#     wl_dir = Path("results/wavelength_analysis")
+#     wl_dir = Path("wavelength_analysis")
 #     wl_dir.mkdir(parents=True, exist_ok=True)
 #     wl_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1651,7 +1653,7 @@ if model_metrics:
 #                     f"     Mode {trip['mode']}: fig={trip['fig']}, mat={trip['mat']}"
 #                 )
 
-# save_dir = "results/plots"
+# save_dir = "plots"
 # os.makedirs(save_dir, exist_ok=True)
 # num_samples_to_display = 6
 # for idx, num_layer in enumerate(num_layer_option):
@@ -1672,7 +1674,7 @@ if model_metrics:
 #         sample_idx=s,
 #         evaluation_regions=evaluation_regions,
 #         detect_radius=detectsize,
-#         save_path=f"results/plots/IO_Pred_Label_RAW_{s}.png",
+#         save_path=f"plots/IO_Pred_Label_RAW_{s}.png",
 #         device=device,
 #         use_big_canvas=False,
 #         sys_scale="bg_pct",
@@ -1686,7 +1688,7 @@ if model_metrics:
 #         reconstructed_fields=all_image_data_pred,
 #         sample_idx=s,
 #         model_idx=0,
-#         save_path=f"results/plots/Reconstruction_vs_Input_{s}.png",
+#         save_path=f"plots/Reconstruction_vs_Input_{s}.png",
 #     )
 
 
@@ -1864,7 +1866,7 @@ if model_metrics:
 # #%% 第一层mask位移
 
 # if run_misalignment_robustness and pred_case == 1:
-#     robustness_dir = Path("results/robustness_analysis")
+#     robustness_dir = Path("robustness_analysis")
 #     robustness_dir.mkdir(parents=True, exist_ok=True)
 #     robustness_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1942,7 +1944,7 @@ if model_metrics:
 
 # #%% Wavelength sweep analysis
 # if pred_case == 1 and all_phase_masks:
-#     wavelength_sweep_dir = Path("results/wavelength_analysis")
+#     wavelength_sweep_dir = Path("wavelength_analysis")
 #     wavelength_sweep_dir.mkdir(parents=True, exist_ok=True)
 #     sweep_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 

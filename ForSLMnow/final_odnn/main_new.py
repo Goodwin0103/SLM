@@ -21,38 +21,33 @@ from scipy.io import savemat
 from torch.optim.lr_scheduler import ExponentialLR
 from torch.utils.data import DataLoader, TensorDataset
 
-from ODNN_functions import (
+from SLM.SLM_MULTIWL.ODNN_functions import (
     create_evaluation_regions,
     generate_complex_weights,
     generate_fields_ts,
 )
-from odnn_generate_label import (
+from SLM.SLM_MULTIWL.odnn_generate_label import (
     compute_label_centers,
     compose_labels_from_patterns,
     generate_detector_patterns,
 )
-from odnn_io import load_complex_modes_from_mat
+from SLM.SLM_MULTIWL.odnn_io import load_complex_modes_from_mat
 from odnn_processing import prepare_sample
 
 # ✅ 你的模型文件里真实存在的类名
-from odnn_multiwl_model import D2NNModelMultiWL
+from SLM.SLM_MULTIWL.odnn_multiwl_model import D2NNModelMultiWL
 
 # ✅ ROI masks
-from odnn_training_eval import build_circular_roi_masks
+from SLM.SLM_MULTIWL.odnn_training_eval import build_circular_roi_masks
 
 # ✅ 复用旧的 superposition 采样上下文（我们会把它的 label map 换成 y_vec）
-from odnn_training_eval import build_superposition_eval_context
+from SLM.SLM_MULTIWL.odnn_training_eval import build_superposition_eval_context
 
 # ✅ NEW: 基于 odnn_training_visualization 扩展出来的 MultiWL 可视化
-from odnn_training_visualization import (
+from SLM.SLM_MULTIWL.odnn_training_visualization import (
     visualize_model_slices_multiwl,
     capture_eigenmode_propagation_multiwl,
 )
-
-# ✅ NEW: 用于 free_space_propagate
-from odnn_model import complex_crop, complex_pad
-from odnn_processing import pad_field_to_layer
-
 
 # ----------------------------
 # Reproducibility / device
@@ -432,53 +427,86 @@ def amplitudes_to_yvec(amplitudes: np.ndarray) -> torch.Tensor:
 # ============================================================
 # ✅ NEW: 自由空间角谱传播 + 按波长生成物理真实标签
 # ============================================================
+# ✅ DELETE these two imports (no longer needed)
+# from odnn_model import complex_crop, complex_pad
+# from odnn_processing import pad_field_to_layer
 
-def free_space_propagate(
-    field_hw: torch.Tensor,
-    wavelength: float,
-    z_total: float,
-    pixel_size_m: float,
-    target_size: int,
-    padding_ratio_val: float = 0.5,
-    dev: torch.device = torch.device("cpu"),
-) -> torch.Tensor:
+# ============================================================
+# ✅ REPLACEMENT: mainfor6/odnn_model 对齐版传播 + 不相干(energy_weights)多波长标签
+# ============================================================
+
+def _complex_pad_mainstyle(E: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
     """
-    对单个 2D 复数场做自由空间角谱传播，返回输出平面的强度 (H, W)。
+    mainfor6/odnn_model 风格：复数 padding（场外补 0）
+    E: (..., H, W) complex
     """
-    H, W = field_hw.shape
-    if H != target_size or W != target_size:
-        E = pad_field_to_layer(field_hw.unsqueeze(0), target_size).squeeze(0)
-    else:
-        E = field_hw.clone()
-    E = E.to(device=dev, dtype=torch.complex64)
+    Er = torch.view_as_real(E)  # (..., H, W, 2)
+    Er_pad = F.pad(Er, (0, 0, pad_w, pad_w, pad_h, pad_h), mode="constant", value=0)
+    return torch.view_as_complex(Er_pad.contiguous())
 
-    pad_px = int(round(target_size * padding_ratio_val))
-    N_pad = target_size + 2 * pad_px
+def _complex_crop_mainstyle(E_pad: torch.Tensor, H: int, W: int, pad_h: int, pad_w: int) -> torch.Tensor:
+    return E_pad[..., pad_h:pad_h + H, pad_w:pad_w + W].contiguous()
 
-    E_pad = complex_pad(E, pad_px, pad_px)
+class _PropagationMultiWLMainstyle(torch.nn.Module):
+    """
+    严格对齐 mainfor6/odnn_model 的传播实现：
+      C = fftshift(fft2(E))
+      Eout = ifft2(ifftshift(C * exp(1j*kz*z)))
+    kz:
+      argument = (2π)^2 * (1/λ^2 - fx^2 - fy^2)
+      kz = sqrt(argument) if argument>=0 else 1j*sqrt(|argument|)
+    """
+    def __init__(self, units: int, dx: float, wavelengths: np.ndarray, z: float, device: torch.device, pad_px: int = 0):
+        super().__init__()
+        self.units = int(units)
+        self.dx = float(dx)
+        self.z = float(z)
+        self.pad_px = int(pad_px)
 
-    fx = torch.fft.fftfreq(N_pad, d=pixel_size_m, device=dev)
-    fy = torch.fft.fftfreq(N_pad, d=pixel_size_m, device=dev)
-    fxx, fyy = torch.meshgrid(fx, fy, indexing='ij')
+        wl = torch.tensor(np.asarray(wavelengths, dtype=np.float32), dtype=torch.float32, device=device)  # (L,)
+        self.register_buffer("wavelengths", wl)
 
-    k = 2 * math.pi / wavelength
-    kz_sq = k**2 - (2 * math.pi * fxx)**2 - (2 * math.pi * fyy)**2
+        self.register_buffer("kz_base", self._make_kz_stack(self.units, self.dx, wl, device))
+        if self.pad_px > 0:
+            units_pad = self.units + 2 * self.pad_px
+            self.register_buffer("kz_pad", self._make_kz_stack(units_pad, self.dx, wl, device))
+        else:
+            self.kz_pad = None
 
-    kz = torch.zeros_like(kz_sq)
-    propagating = kz_sq > 0
-    kz[propagating] = torch.sqrt(kz_sq[propagating])
+    @staticmethod
+    def _make_kz_stack(N: int, dx: float, wavelengths_ts: torch.Tensor, device: torch.device) -> torch.Tensor:
+        fx = torch.fft.fftshift(torch.fft.fftfreq(N, d=dx)).to(device)  # (N,)
+        fxx, fyy = torch.meshgrid(fx, fx, indexing="ij")                # (N,N)
 
-    H_transfer = torch.exp(1j * kz * z_total)
-    H_transfer[~propagating] = 0.0
+        inv_lam2 = (1.0 / wavelengths_ts)[:, None, None] ** 2           # (L,1,1)
+        argument = (2 * torch.pi) ** 2 * (inv_lam2 - fxx[None] ** 2 - fyy[None] ** 2)  # (L,N,N)
 
-    E_freq = torch.fft.fft2(E_pad)
-    E_out_pad = torch.fft.ifft2(E_freq * H_transfer)
+        tmp = torch.sqrt(torch.abs(argument))
+        kz = torch.where(argument >= 0, tmp, 1j * tmp).to(torch.complex64)  # (L,N,N)
+        return kz
 
-    E_out = complex_crop(E_out_pad, target_size, target_size, pad_px, pad_px)
-    I_out = torch.abs(E_out) ** 2
-    return I_out
+    @staticmethod
+    def _propagate(E: torch.Tensor, kz: torch.Tensor, z: float) -> torch.Tensor:
+        # E: (B,L,N,N) complex
+        C = torch.fft.fftshift(torch.fft.fft2(E), dim=(-2, -1))
+        return torch.fft.ifft2(
+            torch.fft.ifftshift(C * torch.exp(1j * kz[None] * z), dim=(-2, -1))
+        )
 
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        assert inputs.is_complex(), "_PropagationMultiWLMainstyle expects complex inputs."
+        B, L, H, W = inputs.shape
+        if L != int(self.wavelengths.numel()):
+            raise ValueError(f"Input L={L} mismatches wavelengths={int(self.wavelengths.numel())}")
 
+        if self.pad_px > 0:
+            p = self.pad_px
+            Ein = _complex_pad_mainstyle(inputs, p, p)                 # 场外补 0
+            Eout = self._propagate(Ein, self.kz_pad, self.z)
+            return _complex_crop_mainstyle(Eout, H, W, p, p)
+        return self._propagate(inputs, self.kz_base, self.z)
+
+@torch.no_grad()
 def compute_per_wavelength_labels(
     amplitudes: np.ndarray,
     mmf_modes: torch.Tensor,
@@ -491,64 +519,78 @@ def compute_per_wavelength_labels(
     pad_ratio: float = 0.5,
 ) -> torch.Tensor:
     """
-    为每个样本、每个波长生成物理真实的能量比例标签。
+    ✅ 最终版：按 energy_weights(=amplitudes**2) 做不相干叠加，多波长生成 ROI ratio 标签
 
     amplitudes: (N, M)
     mmf_modes:  (M, H_field, W_field) complex
     wls:        (L,) wavelengths in meters
-    masks:      (M_roi, H, W) on device
+    masks:      (M_roi, H, W) float on device
     ls:         layer_size
     px:         pixel_size
-    z_tot:      总自由空间传播距离
+    z_tot:      总自由空间传播距离（你按层数算）
     dev:        device
     pad_ratio:  padding_ratio
 
     Returns: (N, L, M_roi) float tensor on CPU
     """
+    amplitudes = np.asarray(amplitudes, dtype=np.float32)
+    wls = np.asarray(wls, dtype=np.float32).reshape(-1)
+
     N, M = amplitudes.shape
-    L_wl = len(wls)
-    M_roi = masks.shape[0]
+    L_wl = int(wls.shape[0])
+    M_roi = int(masks.shape[0])
 
-    # Step 1 & 2: 计算每个模式在每个波长下的 ROI 能量分布
-    E_ref = torch.zeros(M, L_wl, M_roi, dtype=torch.float32, device=dev)
-
-    print(f"  Computing per-wavelength labels (z_total={z_tot*1e6:.1f} μm) ...")
-    with torch.no_grad():
-        for m in range(M):
-            mode_field = mmf_modes[m]
-            for li in range(L_wl):
-                lam = float(wls[li])
-                I_out = free_space_propagate(
-                    field_hw=mode_field,
-                    wavelength=lam,
-                    z_total=z_tot,
-                    pixel_size_m=px,
-                    target_size=ls,
-                    padding_ratio_val=pad_ratio,
-                    dev=dev,
-                )
-                for k in range(M_roi):
-                    E_ref[m, li, k] = (I_out * masks[k]).sum()
-
-    # debug 打印
-    for m in range(M):
-        for li in range(L_wl):
-            wl_nm = wls[li] * 1e9
-            ratios = E_ref[m, li] / (E_ref[m, li].sum() + 1e-12)
-            print(f"    Mode {m}, λ={wl_nm:.1f}nm: ROI ratios = "
-                  f"{ratios.cpu().numpy().round(4)}")
-
-    # Step 3: 对每个样本，按振幅的平方加权（不相干叠加）
-    amp_sq = torch.from_numpy(
-        (amplitudes ** 2).astype(np.float32)
+    # 传播器（mainfor6 对齐）
+    pad_px = int(round(ls * float(pad_ratio)))
+    prop = _PropagationMultiWLMainstyle(
+        units=ls,
+        dx=float(px),
+        wavelengths=wls,
+        z=float(z_tot),
+        device=dev,
+        pad_px=pad_px,
     ).to(dev)
 
-    # einsum: (N,M) x (M,L,K) -> (N,L,K)
-    y_energy = torch.einsum('nm, mlk -> nlk', amp_sq, E_ref)
+    # Step 1&2: 预计算每个 mode 在每个 λ 下的 ROI 能量：E_ref[m, li, k]
+    E_ref = torch.zeros((M, L_wl, M_roi), dtype=torch.float32, device=dev)
 
-    # 归一化为比例
+    print(f"  Computing per-wavelength labels [MAINSTYLE] (z_total={z_tot*1e6:.1f} μm) ...")
+    for m in range(M):
+        mode_field = mmf_modes[m].to(dev, dtype=torch.complex64)  # (Hf,Wf)
+
+        # pad/crop 到 (ls,ls) —— 用与你训练 prepare_sample 一样的 pad_field_to_layer 更“像”，
+        # 但这里我们不依赖 pad_field_to_layer，使用中心 pad 保持稳定。
+        Hf, Wf = mode_field.shape
+        if (Hf != ls) or (Wf != ls):
+            canvas = torch.zeros((ls, ls), dtype=torch.complex64, device=dev)
+            y0 = (ls - Hf) // 2
+            x0 = (ls - Wf) // 2
+            canvas[y0:y0 + Hf, x0:x0 + Wf] = mode_field
+            mode_field = canvas
+
+        # 一次性对所有波长传播： (1,L,H,W)
+        Ein = mode_field[None, None].repeat(1, L_wl, 1, 1).contiguous()
+        Eout = prop(Ein)                     # (1,L,H,W)
+        Iout = torch.abs(Eout) ** 2          # (1,L,H,W)
+
+        # ROI energies： (L,K)
+        # (L,1,H,W) * (1,K,H,W) -> (L,K)
+        Ek = (Iout[0].unsqueeze(1) * masks.unsqueeze(0)).sum(dim=(-1, -2))  # (L,K)
+        E_ref[m] = Ek
+
+    # 可选 debug
+    for m in range(M):
+        for li in range(L_wl):
+            wl_nm = float(wls[li] * 1e9)
+            ratios = E_ref[m, li] / (E_ref[m, li].sum() + 1e-12)
+            print(f"    Mode {m}, λ={wl_nm:.1f}nm: ROI ratios = {ratios.detach().cpu().numpy().round(4)}")
+
+    # Step 3: 不相干叠加：amp_sq (N,M) x E_ref (M,L,K) -> (N,L,K)
+    amp_sq = torch.from_numpy(amplitudes ** 2).to(dev, dtype=torch.float32)     # (N,M)
+    y_energy = torch.einsum("nm, mlk -> nlk", amp_sq, E_ref)                    # (N,L,K)
+
+    # Step 4: 归一化为比例
     y_vec = y_energy / (y_energy.sum(dim=2, keepdim=True) + 1e-12)
-
     return y_vec.cpu()
 
 
@@ -837,7 +879,7 @@ evaluation_regions = create_evaluation_regions(layer_size, layer_size, num_detec
 print("Detection Regions:", evaluation_regions)
 
 if show_detection_overlap_debug:
-    detection_debug_dir = Path("results/1150_1568_1650_base0/detection_region_debug")
+    detection_debug_dir = Path("results/650/detection_region_debug")
     detection_debug_dir.mkdir(parents=True, exist_ok=True)
     overlap_map = np.zeros((layer_size, layer_size), dtype=np.float32)
     for (x0, x1, y0, y1) in evaluation_regions:
@@ -1127,7 +1169,7 @@ for num_layer in num_layer_option:
     # ----------------------------
     # Save training curves
     # ----------------------------
-    training_output_dir = Path("results/1150_1568_1650_base0/training_analysis")
+    training_output_dir = Path("results/650/training_analysis")
     training_output_dir.mkdir(parents=True, exist_ok=True)
 
     epochs_array = np.arange(1, epochs + 1, dtype=np.int32)
@@ -1205,7 +1247,7 @@ for num_layer in num_layer_option:
     # ----------------------------
     # Export phase masks
     # ----------------------------
-    phase_dir = Path("results/1150_1568_1650_base0/phase_masks_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    phase_dir = Path("results/650/phase_masks_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     phase_dir.mkdir(parents=True, exist_ok=True)
 
     tag = f"multiwl_L{num_layer}_m{num_modes}_ls{layer_size}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -1259,7 +1301,7 @@ for num_layer in num_layer_option:
 
         input_E_1hw = test_ds.tensors[0][sample_idx].to(device, dtype=torch.complex64)
 
-        slices_dir = Path("results/1150_1568_1650_base0/propagation_slices_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        slices_dir = Path("results/650/propagation_slices_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         scans, camera_field = visualize_model_slices_multiwl(
             model,
             input_field=input_E_1hw,
@@ -1278,7 +1320,7 @@ for num_layer in num_layer_option:
         print(f"✔ Saved MultiWL slices -> {slices_dir}")
 
     if export_multiwl_snapshots:
-        snap_dir = Path("results/1150_1568_1650_base0/propagation_snapshots_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        snap_dir = Path("results/650/propagation_snapshots_multiwl") / f"L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         eigenmode_index = min(2, MMF_data_ts.shape[0] - 1)
 
         fractions_per_segment = 5
@@ -1388,7 +1430,7 @@ for num_layer in num_layer_option:
     # ----------------------------
     # Save diagnostics figures
     # ----------------------------
-    diag_dir = Path("results/1150_1568_1650_base0/prediction_viz") / f"multiwl_L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    diag_dir = Path("results/650/prediction_viz") / f"multiwl_L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     save_regression_diagnostics(
         model=model,
         dataset=test_ds,
@@ -1423,7 +1465,7 @@ print("Done.")
 
 #%% Metrics vs. layer count (per wavelength + average)
 if model_metrics:
-    metrics_dir = Path("results/1150_1568_1650_base0/metrics_analysis")
+    metrics_dir = Path("results/650/metrics_analysis")
     metrics_dir.mkdir(parents=True, exist_ok=True)
     metrics_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 

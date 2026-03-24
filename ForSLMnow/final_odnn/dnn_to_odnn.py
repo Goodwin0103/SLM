@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import torch
 from odnn_model import D2NNModel
-from odnn_io import load_complex_modes_from_mat
+from SLM.SLM_MULTIWL.odnn_io import load_complex_modes_from_mat
 from odnn_processing import (
     build_spot_masks,
     detector_weights_from_intensity,

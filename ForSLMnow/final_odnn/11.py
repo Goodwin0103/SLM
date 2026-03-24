@@ -9,7 +9,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # 你的模型类（确保路径/文件名正确）
-from odnn_multiwl_model import D2NNModelMultiWL
+from SLM.SLM_MULTIWL.odnn_multiwl_model import D2NNModelMultiWL
 
 
 def load_model_from_ckpt(ckpt_path: str, device: torch.device):

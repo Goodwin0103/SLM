@@ -1,6 +1,7 @@
  
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.patches import Circle
 
 def compute_label_centers(H, W, N, radius):
     """
@@ -80,20 +81,45 @@ def compose_labels_from_patterns(H, W, patterns, centers, Index=None, visualize=
     return output_image
 
 def _shape_score(h, w, shape):
+    """
+    为每种形状返回一个 (h, w) 的距离/优先级评分图。
+    分数越低的像素越优先被选中（用于 equal_area 模式）。
+
+    支持形状：
+        - "circle"  : 实心圆（距离中心越近分数越低）
+        - "square"  : 正方形（Chebyshev 距离）
+        - "diamond" : 菱形（Manhattan 距离）
+        - "plus"    : 十字/加号（离最近轴线越近分数越低）
+        - "ring"    : 圆环（离环中线越近分数越低）
+    """
     cy = (h - 1) / 2.0
     cx = (w - 1) / 2.0
     Y, X = np.ogrid[:h, :w]
-    dx = X - cx
-    dy = Y - cy
+    dx = (X - cx).astype(np.float64)
+    dy = (Y - cy).astype(np.float64)
 
     if shape == "circle":
-        return dx**2 + dy**2
+        return dx ** 2 + dy ** 2
+
     if shape == "square":
         return np.maximum(np.abs(dx), np.abs(dy))
+
     if shape == "diamond":
         return np.abs(dx) + np.abs(dy)
-    raise ValueError(f"未知形状 '{shape}'，可选值为 'circle'、'square' 或 'diamond'。")
 
+    if shape == "plus":
+        # 离水平轴或垂直轴越近 → 分数越低 → 优先选中
+        return np.minimum(np.abs(dx), np.abs(dy))
+
+    if shape == "ring":
+        # 离「环中线」越近 → 分数越低 → 形成圆环
+        dist = np.sqrt(dx ** 2 + dy ** 2)
+        ring_mid_radius = min(h, w) * 0.35  # 环中线半径 ≈ 外径的 70%
+        return np.abs(dist - ring_mid_radius)
+
+    raise ValueError(
+        f"未知形状 '{shape}'，可选值为 'circle'、'square'、'diamond'、'plus'、'ring'。"
+    )
 
 def _build_equal_area_mask(h, w, shape, target_area):
     score = _shape_score(h, w, shape)
@@ -124,10 +150,39 @@ def generate_detector_patterns(
     shapes=None,
     equal_area=False,
     target_area=None,
+    ring_ratio=0.5,        # 圆环内径/外径比（仅 ring + 非 equal_area）
+    plus_thickness=None,   # 十字臂宽像素（仅 plus + 非 equal_area）
     visualize=False,
     save_path=None,
 ):
-   
+    """
+    生成 N 个检测区域图案，支持为每个标签指定不同形状。
+
+    Parameters
+    ----------
+    h, w : int
+        单个图案的高度和宽度。
+    N : int
+        检测器数量。
+    shape : str
+        统一形状（当 shapes=None 时使用）。
+    shapes : list[str] | None
+        每个检测器的形状列表，长度 >= N。
+        可选值: "circle", "square", "diamond", "plus", "ring"
+    equal_area : bool
+        若为 True，所有形状被强制缩放到相同面积（像素数）。
+    target_area : int | None
+        equal_area 模式的目标面积；默认使用内切圆面积。
+    ring_ratio : float
+        圆环内径 = 外径 × ring_ratio（仅 shape="ring" 且 equal_area=False）。
+    plus_thickness : int | None
+        十字臂宽（像素），默认 max(h,w)//5（仅 shape="plus" 且 equal_area=False）。
+    visualize, save_path : 同前。
+
+    Returns
+    -------
+    patterns : np.ndarray, shape (h, w, N)
+    """
     if shapes is None:
         shape_list = [shape] * N
     else:
@@ -139,40 +194,183 @@ def generate_detector_patterns(
         target_area = _default_circle_area(h, w)
 
     patterns = np.zeros((h, w, N), dtype=np.float32)
+
     for i, shape_i in enumerate(shape_list):
         if equal_area:
-            pattern = _build_equal_area_mask(h, w, shape_i, target_area)
+            # ---- 等面积模式：通过 _shape_score 排序截取 ----
+            patterns[:, :, i] = _build_equal_area_mask(h, w, shape_i, target_area)
         else:
+            # ---- 自由模式：按形状几何直接生成 ----
             pattern = np.zeros((h, w), dtype=np.float32)
+            cy_p, cx_p = h // 2, w // 2
+
             if shape_i == "circle":
-                cy, cx = h // 2, w // 2
                 radius = min(h, w) // 2
                 Y, X = np.ogrid[:h, :w]
-                mask = (X - cx) ** 2 + (Y - cy) ** 2 <= radius**2
+                mask = (X - cx_p) ** 2 + (Y - cy_p) ** 2 <= radius ** 2
                 pattern[mask] = 1.0
+
             elif shape_i == "square":
                 pattern[:, :] = 1.0
+
+            elif shape_i == "diamond":
+                radius = min(h, w) // 2
+                Y, X = np.ogrid[:h, :w]
+                mask = np.abs(X - cx_p) + np.abs(Y - cy_p) <= radius
+                pattern[mask] = 1.0
+
+            elif shape_i == "plus":
+                t = plus_thickness if plus_thickness is not None else max(h, w) // 5
+                half_t = t // 2
+                # 水平臂
+                y0 = max(0, cy_p - half_t)
+                y1 = min(h, cy_p + half_t + 1)
+                pattern[y0:y1, :] = 1.0
+                # 垂直臂
+                x0 = max(0, cx_p - half_t)
+                x1 = min(w, cx_p + half_t + 1)
+                pattern[:, x0:x1] = 1.0
+
+            elif shape_i == "ring":
+                outer_radius = min(h, w) // 2
+                inner_radius = int(outer_radius * ring_ratio)
+                Y, X = np.ogrid[:h, :w]
+                dist_sq = (X - cx_p) ** 2 + (Y - cy_p) ** 2
+                mask = (dist_sq <= outer_radius ** 2) & (dist_sq >= inner_radius ** 2)
+                pattern[mask] = 1.0
+
             else:
                 raise ValueError(
-                    f"未知形状 '{shape_i}'，可选值为 'circle' 或 'square'。"
+                    f"未知形状 '{shape_i}'，可选值为 "
+                    f"'circle'、'square'、'diamond'、'plus'、'ring'。"
                 )
-        patterns[:, :, i] = pattern
+            patterns[:, :, i] = pattern
 
-    # 可视化单个检测图案
+    # ---- 可视化（展示所有图案） ----
     if visualize or save_path:
-        plt.figure(figsize=(4, 4))
-        plt.imshow(patterns[:, :, 0], cmap='gray')
-        title_shape = shape_list[0] if shape_list else shape
-        plt.title(f"Detector pattern ({title_shape})")
-        plt.axis('off')
+        fig, axes = plt.subplots(1, N, figsize=(4 * N, 4))
+        if N == 1:
+            axes = [axes]
+        for i in range(N):
+            axes[i].imshow(patterns[:, :, i], cmap='gray', vmin=0, vmax=1)
+            axes[i].set_title(f"#{i+1}: {shape_list[i]}")
+            axes[i].axis('off')
+        plt.suptitle("Detector Patterns", fontsize=14)
+        plt.tight_layout()
         if save_path:
-            plt.savefig(save_path, bbox_inches='tight')
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
         if visualize:
             plt.show()
         plt.close()
 
     return patterns
 
+def generate_detector_patterns_multiwl(
+    H: int,
+    W: int,
+    num_modes: int,
+    num_wavelengths: int,
+    radius: int,
+    pattern_mode: str = "circle",
+    show_debug: bool = False
+) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
+    """
+    生成多波长标签图案 - 按模式分行
+    
+    布局：num_modes 行 × num_wavelengths 列
+    
+    Returns:
+        patterns: (H, W, num_modes * num_wavelengths)
+        evaluation_regions: [(x0, x1, y0, y1), ...]
+    """
+    total_labels = num_modes * num_wavelengths
+    
+    # 🔧 强制按模式数量分行
+    num_rows = num_modes
+    num_cols = num_wavelengths
+    
+    # 计算间距（留出边距）
+    margin = radius * 2
+    available_height = H - 2 * margin
+    available_width = W - 2 * margin
+    
+    row_spacing = available_height / num_rows
+    col_spacing = available_width / num_cols
+    
+    # 计算每个标签的中心坐标
+    centers = []
+    for mode_idx in range(num_modes):
+        for wl_idx in range(num_wavelengths):
+            cy = margin + row_spacing * (mode_idx + 0.5)
+            cx = margin + col_spacing * (wl_idx + 0.5)
+            centers.append((int(cy), int(cx)))
+    
+    # 生成图案
+    if pattern_mode == "circle":
+        patterns = np.zeros((H, W, total_labels), dtype=np.float32)
+        for idx, (cy, cx) in enumerate(centers):
+            yy, xx = np.ogrid[:H, :W]
+            mask = (yy - cy)**2 + (xx - cx)**2 <= radius**2
+            patterns[:, :, idx] = mask.astype(np.float32)
+    else:
+        raise NotImplementedError(f"Unsupported pattern_mode: {pattern_mode}")
+    
+    # 生成评估区域
+    evaluation_regions = []
+    for cy, cx in centers:
+        x0 = max(0, int(cx - radius))
+        x1 = min(W, int(cx + radius))
+        y0 = max(0, int(cy - radius))
+        y1 = min(H, int(cy + radius))
+        evaluation_regions.append((x0, x1, y0, y1))
+    
+    if show_debug:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax.imshow(patterns.sum(axis=2), cmap='gray')
+        ax.set_title(f"MultiWL Labels: {num_modes} modes (rows) × {num_wavelengths} wavelengths (cols)", 
+                    fontsize=14, fontweight='bold')
+        
+        # 绘制每个标签
+        for idx, (cy, cx) in enumerate(centers):
+            mode_idx = idx // num_wavelengths
+            wl_idx = idx % num_wavelengths
+            
+            # 每个模式用不同颜色
+            color = plt.cm.Set3(mode_idx % 12)
+            
+            # 绘制圆形
+            circle = Circle((cx, cy), radius=radius, 
+                          linewidth=1.5, edgecolor=color, 
+                          facecolor='none', alpha=0.8)
+            ax.add_patch(circle)
+            
+            # 标注
+            ax.text(cx, cy, f"M{mode_idx}W{wl_idx}", 
+                   ha='center', va='center', 
+                   color='white', fontsize=7, fontweight='bold',
+                   bbox=dict(boxstyle='round,pad=0.3', 
+                           facecolor=color, edgecolor='black', 
+                           linewidth=0.8, alpha=0.85))
+        
+        # 添加网格线辅助查看
+        for i in range(1, num_rows):
+            y = margin + row_spacing * i
+            ax.axhline(y=y, color='cyan', linestyle='--', linewidth=0.8, alpha=0.5)
+        
+        for j in range(1, num_cols):
+            x = margin + col_spacing * j
+            ax.axvline(x=x, color='cyan', linestyle='--', linewidth=0.8, alpha=0.5)
+        
+        ax.set_xlabel(f"Wavelength Index (0-{num_wavelengths-1})", fontsize=11)
+        ax.set_ylabel(f"Mode Index (0-{num_modes-1})", fontsize=11)
+        ax.axis('on')
+        
+        plt.tight_layout()
+        plt.savefig(RUN_ROOT / "debug_multiwl_labels.png", dpi=200, bbox_inches='tight')
+        plt.close()
+        print(f"✔ Debug label layout saved -> {RUN_ROOT / 'debug_multiwl_labels.png'}")
+    
+    return patterns, evaluation_regions
 
 def main():
     import os
@@ -222,6 +420,32 @@ def main():
     )
     print(f"Detector layout visualization saved to: {detector_layout_path}")
 
-
 if __name__ == "__main__":
-    main()
+    # 快速验证三种形状
+    h, w, N = 41, 41, 3
+    shapes = ["square", "plus", "ring"]
+
+    # --- 非等面积模式 ---
+    p1 = generate_detector_patterns(
+        h, w, N, shapes=shapes, equal_area=False,
+        ring_ratio=0.5, plus_thickness=7,
+        visualize=True, save_path="demo_free_area.png"
+    )
+    for i in range(N):
+        print(f"  {shapes[i]:>8s}  面积 = {int(p1[:,:,i].sum())} px")
+
+    # --- 等面积模式 ---
+    p2 = generate_detector_patterns(
+        h, w, N, shapes=shapes, equal_area=True,
+        visualize=True, save_path="demo_equal_area.png"
+    )
+    for i in range(N):
+        print(f"  {shapes[i]:>8s}  面积 = {int(p2[:,:,i].sum())} px")
+
+    # --- 组合到大图 ---
+    H, W = 150, 150
+    radius = 20
+    centers, _, _ = compute_label_centers(H, W, N, radius)
+    output = compose_labels_from_patterns(
+        H, W, p2, centers, visualize=True, save_path="demo_layout.png"
+    )

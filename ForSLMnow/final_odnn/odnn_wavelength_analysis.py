@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from odnn_model import D2NNModel
-from odnn_training_eval import evaluate_spot_metrics, spot_energy_ratios_circle
+from SLM.SLM_MULTIWL.odnn_training_eval import evaluate_spot_metrics, spot_energy_ratios_circle
 
 
 @dataclass(frozen=True)
