@@ -34,39 +34,65 @@ def compute_label_centers(H, W, N, radius):
 
     return centers, row_spacing, col_spacing
 
-
-def compose_labels_from_patterns(H, W, patterns, centers, Index=None, visualize=False, save_path=None):
-    
+def compose_labels_from_patterns(H, W, patterns, centers, Index=None, 
+                                 visualize=False, save_path=None, 
+                                 auto_crop=True):  # 🔧 新增参数
     h, w, N = patterns.shape
     output_image = np.zeros((H, W))
 
-    # 决定要绘制哪些图案
     if Index is None:
         indices_to_draw = range(N)
     else:
         if not (1 <= Index <= N):
-            raise ValueError(f"Index 应在 1~{N} 范围内，但得到 {Index}")
+            raise ValueError(f"Index 应在 1~{N} 范围内,但得到 {Index}")
         indices_to_draw = [Index - 1]
 
-    # 绘制图案
     for i in indices_to_draw:
         cy, cx = centers[i]
         pattern = patterns[:, :, i]
+        
+        if auto_crop:
+            # 🔧 自动裁剪到有效区域
+            rows, cols = np.where(pattern > 0.5)
+            if rows.size == 0:
+                continue
+            
+            pattern_y0 = rows.min()
+            pattern_y1 = rows.max() + 1
+            pattern_x0 = cols.min()
+            pattern_x1 = cols.max() + 1
+            
+            cropped = pattern[pattern_y0:pattern_y1, pattern_x0:pattern_x1]
+            crop_h, crop_w = cropped.shape
+            
+            y0 = cy - crop_h // 2
+            y1 = y0 + crop_h
+            x0 = cx - crop_w // 2
+            x1 = x0 + crop_w
+            
+            if y0 < 0 or y1 > H or x0 < 0 or x1 > W:
+                print(f"⚠️  图案 {i+1} 超出边界")
+                continue
+            
+            output_image[y0:y1, x0:x1] = np.maximum(
+                output_image[y0:y1, x0:x1], cropped
+            )
+        else:
+            # 原始逻辑
+            y0 = cy - h // 2
+            y1 = y0 + h
+            x0 = cx - w // 2
+            x1 = x0 + w
+            
+            if y0 < 0 or y1 > H or x0 < 0 or x1 > W:
+                print(f"⚠️  图案 {i+1} 超出边界")
+                continue
+            
+            output_image[y0:y1, x0:x1] = np.maximum(
+                output_image[y0:y1, x0:x1], pattern[:y1-y0, :x1-x0]
+            )
 
-        y0 = cy - h // 2
-        y1 = y0 + h
-        x0 = cx - w // 2
-        x1 = x0 + w
-
-        if y0 < 0 or y1 > H or x0 < 0 or x1 > W:
-            print(f"⚠️  图案 {i+1} 超出边界，已跳过。")
-            continue
-        output_image[y0:y1, x0:x1] = np.maximum(
-            output_image[y0:y1, x0:x1],
-            pattern[:y1 - y0, :x1 - x0]
-        )
-
-    # 可视化
+    # 可视化部分不变...
     if visualize or save_path:
         plt.figure(figsize=(6, 6))
         plt.imshow(output_image, cmap='gray')
@@ -78,6 +104,7 @@ def compose_labels_from_patterns(H, W, patterns, centers, Index=None, visualize=
         if visualize:
             plt.show()
         plt.close()
+    
     return output_image
 
 def _shape_score(h, w, shape):
@@ -98,7 +125,7 @@ def _shape_score(h, w, shape):
     dx = (X - cx).astype(np.float64)
     dy = (Y - cy).astype(np.float64)
 
-    if shape == "circle":
+    if shape == "circle" or shape == "larger_circle" or shape == "small_circle":
         return dx ** 2 + dy ** 2
 
     if shape == "square":
@@ -168,7 +195,7 @@ def generate_detector_patterns(
         统一形状（当 shapes=None 时使用）。
     shapes : list[str] | None
         每个检测器的形状列表，长度 >= N。
-        可选值: "circle", "square", "diamond", "plus", "ring"
+        可选值: "circle", "square", "diamond", "plus", "ring", "larger_circle"
     equal_area : bool
         若为 True，所有形状被强制缩放到相同面积（像素数）。
     target_area : int | None
@@ -210,6 +237,19 @@ def generate_detector_patterns(
                 mask = (X - cx_p) ** 2 + (Y - cy_p) ** 2 <= radius ** 2
                 pattern[mask] = 1.0
 
+            elif shape_i == "larger_circle":
+                # Define a larger circle with a radius 90% of the smaller dimension
+                radius = int(min(h, w) * 0.6)  # 90% diameter = 45% radius
+                Y, X = np.ogrid[:h, :w]
+                mask = (X - cx_p) ** 2 + (Y - cy_p) ** 2 <= radius ** 2
+                pattern[mask] = 1.0
+
+            elif shape_i == "small_circle":
+                radius = min(h, w) // 4  # 半径为原始圆的 1/4
+                Y, X = np.ogrid[:h, :w]
+                mask = (X - cx_p) ** 2 + (Y - cy_p) ** 2 <= radius ** 2
+                pattern[mask] = 1.0
+
             elif shape_i == "square":
                 pattern[:, :] = 1.0
 
@@ -242,7 +282,7 @@ def generate_detector_patterns(
             else:
                 raise ValueError(
                     f"未知形状 '{shape_i}'，可选值为 "
-                    f"'circle'、'square'、'diamond'、'plus'、'ring'。"
+                    f"'circle'、'square'、'diamond'、'plus'、'ring'、'larger_circle'。"
                 )
             patterns[:, :, i] = pattern
 
@@ -423,7 +463,7 @@ def main():
 if __name__ == "__main__":
     # 快速验证三种形状
     h, w, N = 41, 41, 3
-    shapes = ["square", "plus", "ring"]
+    shapes = ["larger_circle", "circle", "small_circle"]  # 可选 "circle"、"square"、"diamond"、"plus"、"ring"、"larger_circle"
 
     # --- 非等面积模式 ---
     p1 = generate_detector_patterns(

@@ -109,7 +109,7 @@ save_superposition_slices = True
 run_misalignment_robustness = True
 label_pattern_mode = "mixed"  # options: "eigenmode", "circle", "mixed"
 # Use when label_pattern_mode == "mixed" to assign different shapes per detector.
-detector_shapes = ["plus", "ring", "plus"]
+detector_shapes = ["small_circle", "plus", "circle"]  # 可选 "circle"、"square"、"diamond"、"plus"、"ring"、"larger_circle"
 superposition_eval_seed = 20240116   # 控制 superposition 测试集的随机性
 show_detection_overlap_debug = True
 detection_overlap_label_index = 0
@@ -288,7 +288,7 @@ if pred_case == 1: # 3
             pattern_size,
             num_detector,
             shapes=detector_shapes,
-            equal_area=True,
+            equal_area=False,
         )
         layout_radius = circle_radius
         detector_focus_radius = circle_radius
@@ -297,6 +297,13 @@ if pred_case == 1: # 3
         raise ValueError(f"Unknown label_pattern_mode: {label_pattern_mode}")
 
     centers, _, _ = compute_label_centers(label_size, label_size, num_detector, layout_radius)
+
+    # centers, row_spacing, col_spacing = compute_label_centers(label_size, label_size, num_detector, layout_radius)
+
+    # # ==== 重新排列顺序：让 M1 在中间 ====
+    # if num_detector == 3:
+    #     centers = [centers[1], centers[0], centers[2]]   # 中、左、右
+
     mode_label_maps = [
         compose_labels_from_patterns(
             label_size,
@@ -583,7 +590,7 @@ def run_experiment_for_layer_size(
             pattern_size,
             num_detector,
             shapes=detector_shapes,
-            equal_area=True,
+            equal_area=False,
         )
         layout_radius = circle_radius
         detector_focus_radius = circle_radius
