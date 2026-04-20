@@ -17,16 +17,21 @@ def load_complex_modes_from_mat(
     ),
 ) -> np.ndarray:
     
-    def _to_complex(arr: np.ndarray | dict) -> np.ndarray:
-        if isinstance(arr, np.ndarray) and np.iscomplexobj(arr):
-            return arr.astype(np.complex64, copy=False)
-        if isinstance(arr, dict):
-            for re_key, im_key in (("real", "imag"), ("realPart", "imagPart"), ("Re", "Im")):
-                if re_key in arr and im_key in arr:
-                    return (np.asarray(arr[re_key]) + 1j * np.asarray(arr[im_key])).astype(np.complex64)
-        if hasattr(arr, "dtype") and np.iscomplexobj(arr):
-            return np.asarray(arr, dtype=np.complex64)
-        raise ValueError("Unsupported data format: expected complex array or dict with real/imag parts.")
+    def _to_complex(arr):
+        """
+        Convert input array to complex format.
+        If the input is real, assume the imaginary part is zero.
+        """
+        if np.iscomplexobj(arr):
+            return arr
+        elif isinstance(arr, np.ndarray):
+            # Assume imaginary part is zero
+            return arr.astype(np.complex64)
+        elif isinstance(arr, dict) and 'real' in arr and 'imag' in arr:
+            # Combine real and imaginary parts from a dictionary
+            return arr['real'] + 1j * arr['imag']
+        else:
+            raise ValueError("Unsupported data format: expected complex array or dict with real/imag parts.")
 
     mat_path = Path(mat_path)
     if not mat_path.exists():
@@ -43,7 +48,7 @@ def load_complex_modes_from_mat(
         arr = data[keys[0]]
         complex_modes = _to_complex(arr)
     except Exception:
-        data = mat73.loadmat(str(mat_path))
+        data = loadmat(str(mat_path))
         keys = [key] if key else [k for k in key_candidates if k in data] or [next(iter(data.keys()))]
         arr = data[keys[0]]
         complex_modes = _to_complex(arr)

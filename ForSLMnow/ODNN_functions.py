@@ -901,7 +901,7 @@ def load_mmf_modes_hdf5(
     *,
     normalize: bool = True,
     plot: bool = True,
-    save_path: str | None = None,
+    save_path: str,
 ):
     
     with h5py.File(filename, "r") as f:

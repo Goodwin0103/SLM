@@ -30,6 +30,7 @@ from odnn_generate_label import (
     compute_label_centers,
     compose_labels_from_patterns,
     generate_detector_patterns,
+    build_evaluation_regions_from_centers,
 )
 from odnn_io import load_complex_modes_from_mat
 from odnn_model import D2NNModel
@@ -85,14 +86,14 @@ else:
 
 #%% data generation (lightfield)
 field_size = 123 # the field size in eigenmodes_OM4 is 25 pixels
-layer_size_options = [300]  # layer canvas size sweep
+layer_size_options = [500]  # layer canvas size sweep
 run_layer_size_sweep = False  # toggle to run a sweep before the legacy single run
 layer_size = layer_size_options[0]
 num_data = 1000 # options: 1. random datas 2.eigenmodes
-num_modes = 3 #default: take first N modes from the 103-mode file
+num_modes = 6 #default: take first N modes from the 103-mode file
 num_modes_sweep_options = [0]
-circle_focus_radius = 20 # radius when using uniform circular detectors
-circle_detectsize = 40  # durchmeter (/2)
+circle_focus_radius = 10 # radius when using uniform circular detectors
+circle_detectsize = 20  # durchmeter (/2)
 eigenmode_focus_radius = 12.5  # radius when using eigenmode patterns
 eigenmode_detectsize = 15    # square window size for eigenmode patterns
 focus_radius = circle_focus_radius
@@ -107,9 +108,10 @@ run_superposition_debug = True
 save_superposition_plots = True
 save_superposition_slices = True
 run_misalignment_robustness = True
-label_pattern_mode = "mixed"  # options: "eigenmode", "circle", "mixed"
+# label_pattern_mode = "mixed"  # options: "eigenmode", "circle", "mixed"
+label_pattern_mode = "eigenmode"  # options: "eigenmode", "circle", "mixed"
 # Use when label_pattern_mode == "mixed" to assign different shapes per detector.
-detector_shapes = ["small_circle", "plus", "circle"]  # 可选 "circle"、"square"、"diamond"、"plus"、"ring"、"larger_circle"
+# detector_shapes = ["small_circle", "circle", "larger_circle"]  # 可选 "circle"、"square"、"diamond"、"plus"、"ring"、"small_circle", "larger_circle"
 superposition_eval_seed = 20240116   # 控制 superposition 测试集的随机性
 show_detection_overlap_debug = True
 detection_overlap_label_index = 0
@@ -208,7 +210,7 @@ def build_uniform_fractions(count: int) -> tuple[float, ...]:
 #%% 从 .mat 载入 (H, W, M) 的复数模场
 max_modes_needed = max([num_modes] + num_modes_sweep_options)
 eigenmodes_OM4 = load_complex_modes_from_mat(
-    'mmf_3modes_123_PD_1.2.mat',
+    'mmf_10modes_GRIN_123_PD1.2.mat',
     key='modes_field'
 )
 print("Loaded modes shape:", eigenmodes_OM4.shape, "dtype:", eigenmodes_OM4.dtype)
@@ -256,15 +258,18 @@ if pred_case == 1: # 3
     detector_focus_radius = focus_radius
     detector_detectsize = detectsize
     if label_pattern_mode == "eigenmode":
-        pattern_stack = np.transpose(np.abs(MMF_data), (1, 2, 0))
-        pattern_h, pattern_w, _ = pattern_stack.shape
-        if pattern_h > label_size or pattern_w > label_size:
-            raise ValueError(
-                f"Eigenmode pattern size ({pattern_h}x{pattern_w}) exceeds label canvas {label_size}."
-            )
-        layout_radius = math.ceil(max(pattern_h, pattern_w) / 2)
+        pattern_size = eigenmode_detectsize
+        if pattern_size % 2 == 0:
+            pattern_size += 1                    # 确保奇数，圆心在正中
+        pattern_stack = generate_detector_patterns(
+            pattern_size, pattern_size, num_detector, shape="larger_circle"
+        )
+        print(f"✅ Eigenmode 标签改用圆形点: {pattern_size}×{pattern_size}, "
+              f"圆半径≈{pattern_size // 2}")
+        layout_radius = math.ceil(pattern_size / 2)
         detector_focus_radius = eigenmode_focus_radius
         detector_detectsize = eigenmode_detectsize
+
     elif label_pattern_mode == "circle":
         circle_radius = circle_focus_radius
         pattern_size = circle_radius * 2
@@ -396,7 +401,7 @@ train_loader = DataLoader(
     generator=g,                # 固定打乱
    
 )
-superposition_eval_ctx: dict | None = None
+superposition_eval_ctx: dict
 if evaluation_mode == "eigenmode":
     test_dataset = train_dataset
     test_tensor_data = train_tensor_data
@@ -434,11 +439,14 @@ else:
     raise ValueError(f"Unknown evaluation_mode: {evaluation_mode}")
 
 #%% Generate detection regions using existing function
-if pred_case ==1:
-    evaluation_regions = create_evaluation_regions(layer_size, layer_size, num_detector, focus_radius, detectsize)
+if pred_case == 1:
+    evaluation_regions = build_evaluation_regions_from_centers(
+        centers, detectsize, layer_size, layer_size
+    )
     print("Detection Regions:", evaluation_regions)
+
     if show_detection_overlap_debug:
-        detection_debug_dir = Path("results/detection_region_debug")
+        detection_debug_dir = Path("results_6modes/detection_region_debug")
         detection_debug_dir.mkdir(parents=True, exist_ok=True)
         if detection_masks is not None:
             overlap_map = np.sum(detection_masks > 0.5, axis=0).astype(np.float32)
@@ -544,7 +552,7 @@ def run_experiment_for_layer_size(
     """
     print(f"\n===== Running experiment for layer_size={layer_size}, num_modes={num_modes} =====")
     viz_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    viz_root = Path("results/prediction_viz") / f"m{num_modes}_ls{layer_size}_{viz_tag}"
+    viz_root = Path("results_6modes/prediction_viz") / f"m{num_modes}_ls{layer_size}_{viz_tag}"
     label_size = layer_size
     focus_radius = circle_focus_radius
     detectsize = circle_detectsize
@@ -558,14 +566,16 @@ def run_experiment_for_layer_size(
     detector_focus_radius = focus_radius
     detector_detectsize = detectsize
     if label_pattern_mode == "eigenmode":
-        pattern_stack = np.transpose(np.abs(mmf_data_np), (1, 2, 0))
-        pattern_h, pattern_w, _ = pattern_stack.shape
-        if pattern_h > label_size or pattern_w > label_size:
-            raise ValueError(
-                f"Eigenmode pattern size ({pattern_h}x{pattern_w}) exceeds label canvas {label_size}."
-            )
-        layout_radius = math.ceil(max(pattern_h, pattern_w) / 2)
+        pattern_size = eigenmode_detectsize
+        if pattern_size % 2 == 0:
+            pattern_size += 1
+        pattern_stack = generate_detector_patterns(
+            pattern_size, pattern_size, num_detector, shape="larger_circle"
+        )
+        layout_radius = math.ceil(pattern_size / 2)
         detector_focus_radius = eigenmode_focus_radius
+        detector_detectsize = eigenmode_detectsize
+
         detector_detectsize = eigenmode_detectsize
     elif label_pattern_mode == "circle":
         circle_radius = circle_focus_radius
@@ -712,7 +722,10 @@ def run_experiment_for_layer_size(
     else:
         raise ValueError(f"Unknown evaluation_mode: {evaluation_mode}")
 
-    evaluation_regions = create_evaluation_regions(label_size, label_size, num_detector, focus_radius, detectsize)
+    # ✅ 使用与标签相同的 centers 构建检测区域
+    evaluation_regions = build_evaluation_regions_from_centers(
+        centers, detectsize, label_size, label_size
+    )
 
     layer_results: list[dict] = []
     for num_layer in num_layer_option:
@@ -823,7 +836,7 @@ def run_experiment_for_layer_size(
 
 #%% D2NN models and train them，可以考虑多种layersize的可能
 if run_layer_size_sweep:
-    sweep_dir = Path("results/layer_size_sweep")
+    sweep_dir = Path("results_6modes/layer_size_sweep")
     sweep_dir.mkdir(parents=True, exist_ok=True)
     sweep_results = []
     rel_err_matrix = np.full(
@@ -966,7 +979,7 @@ for num_layer in num_layer_option:
         f'(~{total_training_time / 60:.2f} minutes)'
     )
     all_losses.append(losses)  # save the loss for each model
-    training_output_dir = Path("results/training_analysis")
+    training_output_dir = Path("results_6modes/training_analysis")
     training_output_dir.mkdir(parents=True, exist_ok=True)
     epochs_array = np.arange(1, epochs + 1, dtype=np.int32)
     cumulative_epoch_times = np.cumsum(epoch_durations)
@@ -1011,7 +1024,7 @@ for num_layer in num_layer_option:
     print(f"✔ Saved cumulative time plot -> {time_plot_path}")
     print(f"✔ Saved training log data (.mat) -> {mat_path}")
 
-    propagation_dir = Path("results/propagation_slices")
+    propagation_dir = Path("results_6modes/propagation_slices")
     eigenmode_index = min(2, MMF_data_ts.shape[0] - 1)
     layer_fractions = [build_uniform_fractions(prop_slices_per_segment) for _ in range(num_layer)]
     output_fractions = build_uniform_fractions(prop_output_slices)
@@ -1048,9 +1061,9 @@ for num_layer in num_layer_option:
         #     )
         #     print(f"   z/energy (first slices): {preview}")
 
-    mode_triptych_records: list[dict[str, str | int]] = []
+    mode_triptych_records: list[dict[str]] = []
     if evaluation_mode == "eigenmode":
-        triptych_dir = Path("results/mode_triptychs")
+        triptych_dir = Path("results_6modes/mode_triptychs")
         mode_tag = f"layers{num_layer}_m{num_modes}_{timestamp_tag}"
         for mode_idx in range(min(num_modes, len(MMF_data_ts))):
             label_tensor = label_data[mode_idx, 0]
@@ -1125,7 +1138,7 @@ for num_layer in num_layer_option:
     all_phase_masks.append(phase_masks)
 
     # 存给matlab用SLM的mask.mat
-    mask_dir = Path("results_MD")
+    mask_dir = Path("results")
     mask_dir.mkdir(parents=True, exist_ok=True)
     mask_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     mask_mat_path = mask_dir / f"phase_masks_{len(phase_masks)}layers_{mask_tag}.mat"
@@ -1159,7 +1172,7 @@ for num_layer in num_layer_option:
     )
 
     # Qualitative check: label vs prediction heatmaps + amplitude bars
-    diag_dir = Path("results/prediction_viz") / f"main_L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    diag_dir = Path("results_6modes/prediction_viz") / f"main_L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     diag_paths = save_prediction_diagnostics(
         D2NN,
         test_dataset,
@@ -1202,7 +1215,7 @@ for num_layer in num_layer_option:
 #%% Metrics vs. layer count
 
 if model_metrics:
-    metrics_dir = Path("results/metrics_analysis")
+    metrics_dir = Path("results_6modes/metrics_analysis")
     metrics_dir.mkdir(parents=True, exist_ok=True)
     metrics_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1295,7 +1308,7 @@ z_start = 0.0
 z_step = 5e-6
 z_prop_plus = z_prop
 
-save_root = Path("results_MD")
+save_root = Path("results_6modes/mask")
 save_root.mkdir(parents=True, exist_ok=True)
 run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 filename_prefix = f"ODNN_vis_{run_stamp}"
@@ -1361,7 +1374,7 @@ for i_model, phase_masks in phase_mask_entries:
 # #%% 第一层mask做一些位移
 
 # if run_misalignment_robustness and pred_case == 1:
-#     robustness_dir = Path("results/robustness_analysis")
+#     robustness_dir = Path("results_6modes/robustness_analysis")
 #     robustness_dir.mkdir(parents=True, exist_ok=True)
 #     robustness_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 

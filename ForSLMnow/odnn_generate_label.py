@@ -232,20 +232,20 @@ def generate_detector_patterns(
             cy_p, cx_p = h // 2, w // 2
 
             if shape_i == "circle":
-                radius = min(h, w) // 2
+                radius = min(h, w) // 4
                 Y, X = np.ogrid[:h, :w]
                 mask = (X - cx_p) ** 2 + (Y - cy_p) ** 2 <= radius ** 2
                 pattern[mask] = 1.0
 
             elif shape_i == "larger_circle":
                 # Define a larger circle with a radius 90% of the smaller dimension
-                radius = int(min(h, w) * 0.6)  # 90% diameter = 45% radius
+                radius = min(h, w) // 2  # 90% diameter = 45% radius
                 Y, X = np.ogrid[:h, :w]
                 mask = (X - cx_p) ** 2 + (Y - cy_p) ** 2 <= radius ** 2
                 pattern[mask] = 1.0
 
             elif shape_i == "small_circle":
-                radius = min(h, w) // 4  # 半径为原始圆的 1/4
+                radius = min(h, w) // 8  # 半径为原始圆的 1/8
                 Y, X = np.ogrid[:h, :w]
                 mask = (X - cx_p) ** 2 + (Y - cy_p) ** 2 <= radius ** 2
                 pattern[mask] = 1.0
@@ -489,3 +489,31 @@ if __name__ == "__main__":
     output = compose_labels_from_patterns(
         H, W, p2, centers, visualize=True, save_path="demo_layout.png"
     )
+
+def build_evaluation_regions_from_centers(centers, detectsize, H, W):
+    """
+    从已有的标签中心坐标构建 evaluation_regions，保证与标签布局完全一致。
+
+    Parameters
+    ----------
+    centers : list of (cy, cx)
+        由 compute_label_centers 返回的中心坐标列表。
+    detectsize : int
+        检测窗口边长（像素）。
+    H, W : int
+        画布高度和宽度。
+
+    Returns
+    -------
+    evaluation_regions : list of (x0, x1, y0, y1)
+        每个检测器的矩形边界。
+    """
+    half = detectsize // 2
+    evaluation_regions = []
+    for cy, cx in centers:
+        x0 = max(0, int(cx - half))
+        x1 = min(W, int(cx - half + detectsize))
+        y0 = max(0, int(cy - half))
+        y1 = min(H, int(cy - half + detectsize))
+        evaluation_regions.append((x0, x1, y0, y1))
+    return evaluation_regions
