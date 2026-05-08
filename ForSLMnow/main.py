@@ -85,8 +85,8 @@ else:
 
 
 #%% data generation (lightfield)
-field_size = 123 # the field size in eigenmodes_OM4 is 25 pixels
-layer_size_options = [500]  # layer canvas size sweep
+field_size = 176 # the field size in eigenmodes_OM4 is 25 pixels
+layer_size_options = [250]  # layer canvas size sweep
 run_layer_size_sweep = False  # toggle to run a sweep before the legacy single run
 layer_size = layer_size_options[0]
 num_data = 1000 # options: 1. random datas 2.eigenmodes
@@ -154,7 +154,7 @@ all_training_summaries: list[dict] = []
 # SLM
 z_layers   = 49.465e-3        # 原 47.571e-3  -> 40 μm
 pixel_size = 12.5e-6
-z_prop     = 20e-2        # 原 16.74e-2   -> 60 μm plus 40（最后一层到相机）
+z_prop     = 22e-2        # 原 16.74e-2   -> 60 μm plus 40（最后一层到相机）
 wavelength = 654e-9      # 原 1568     -> 1550 nm
 z_input_to_first = 0 # 40 μm # 新增：输入面到第一层的传播距离
 
@@ -210,7 +210,7 @@ def build_uniform_fractions(count: int) -> tuple[float, ...]:
 #%% 从 .mat 载入 (H, W, M) 的复数模场
 max_modes_needed = max([num_modes] + num_modes_sweep_options)
 eigenmodes_OM4 = load_complex_modes_from_mat(
-    'mmf_10modes_GRIN_123_PD1.2.mat',
+    'mmf_10modes_GRIN_176_PD1.2.mat',
     key='modes_field'
 )
 print("Loaded modes shape:", eigenmodes_OM4.shape, "dtype:", eigenmodes_OM4.dtype)
