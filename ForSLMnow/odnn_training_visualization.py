@@ -1003,6 +1003,7 @@ def save_mode_triptych(
     evaluation_regions: Sequence[Tuple[int, int, int, int]] | None = None,
     detect_radius: int | None = None,
     show_mask_overlays: bool = False,
+    overlay_on_input: bool = False,
 ) -> dict[str, str]:
     """
     Save a triptych (input, model output, label) for a specific eigenmode and export data to MAT.
@@ -1028,7 +1029,7 @@ def save_mode_triptych(
     im0 = axes[0].imshow(input_intensity, cmap="inferno", vmin=0, vmax=vmax)
     axes[0].set_title(f"Mode {mode_index + 1} Input")
     axes[0].axis("off")
-    if show_mask_overlays:
+    if show_mask_overlays and overlay_on_input:
         _overlay_detector_masks(axes[0], evaluation_regions, detect_radius)
 
     im1 = axes[1].imshow(output_intensity, cmap="inferno", vmin=0, vmax=vmax)

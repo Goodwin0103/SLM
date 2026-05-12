@@ -101,7 +101,7 @@ detectsize = circle_detectsize
 batch_size = 16
 
 # Evaluation selection: "eigenmode" uses the base modes, "superposition" samples random mixtures
-evaluation_mode = "superposition"  # options: "eigenmode", "superposition"
+evaluation_mode = "eigenmode"  # options: "eigenmode", "superposition"
 num_superposition_eval_samples = 1000 #评估是看1000个样本
 num_superposition_visual_samples = 2  #选两个看看那个对比标签啥的样本
 run_superposition_debug = True
@@ -446,7 +446,7 @@ if pred_case == 1:
     print("Detection Regions:", evaluation_regions)
 
     if show_detection_overlap_debug:
-        detection_debug_dir = Path("results_6modes/detection_region_debug")
+        detection_debug_dir = Path("results_6modes_eigenmode/detection_region_debug")
         detection_debug_dir.mkdir(parents=True, exist_ok=True)
         if detection_masks is not None:
             overlap_map = np.sum(detection_masks > 0.5, axis=0).astype(np.float32)
@@ -552,7 +552,7 @@ def run_experiment_for_layer_size(
     """
     print(f"\n===== Running experiment for layer_size={layer_size}, num_modes={num_modes} =====")
     viz_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    viz_root = Path("results_6modes/prediction_viz") / f"m{num_modes}_ls{layer_size}_{viz_tag}"
+    viz_root = Path("results_6modes_eigenmode/prediction_viz") / f"m{num_modes}_ls{layer_size}_{viz_tag}"
     label_size = layer_size
     focus_radius = circle_focus_radius
     detectsize = circle_detectsize
@@ -836,7 +836,7 @@ def run_experiment_for_layer_size(
 
 #%% D2NN models and train them，可以考虑多种layersize的可能
 if run_layer_size_sweep:
-    sweep_dir = Path("results_6modes/layer_size_sweep")
+    sweep_dir = Path("results_6modes_eigenmode/layer_size_sweep")
     sweep_dir.mkdir(parents=True, exist_ok=True)
     sweep_results = []
     rel_err_matrix = np.full(
@@ -979,7 +979,7 @@ for num_layer in num_layer_option:
         f'(~{total_training_time / 60:.2f} minutes)'
     )
     all_losses.append(losses)  # save the loss for each model
-    training_output_dir = Path("results_6modes/training_analysis")
+    training_output_dir = Path("results_6modes_eigenmode/training_analysis")
     training_output_dir.mkdir(parents=True, exist_ok=True)
     epochs_array = np.arange(1, epochs + 1, dtype=np.int32)
     cumulative_epoch_times = np.cumsum(epoch_durations)
@@ -1024,7 +1024,7 @@ for num_layer in num_layer_option:
     print(f"✔ Saved cumulative time plot -> {time_plot_path}")
     print(f"✔ Saved training log data (.mat) -> {mat_path}")
 
-    propagation_dir = Path("results_6modes/propagation_slices")
+    propagation_dir = Path("results_6modes_eigenmode/propagation_slices")
     eigenmode_index = min(2, MMF_data_ts.shape[0] - 1)
     layer_fractions = [build_uniform_fractions(prop_slices_per_segment) for _ in range(num_layer)]
     output_fractions = build_uniform_fractions(prop_output_slices)
@@ -1063,7 +1063,7 @@ for num_layer in num_layer_option:
 
     mode_triptych_records: list[dict[str]] = []
     if evaluation_mode == "eigenmode":
-        triptych_dir = Path("results_6modes/mode_triptychs")
+        triptych_dir = Path("results_6modes_eigenmode/mode_triptychs")
         mode_tag = f"layers{num_layer}_m{num_modes}_{timestamp_tag}"
         for mode_idx in range(min(num_modes, len(MMF_data_ts))):
             label_tensor = label_data[mode_idx, 0]
@@ -1138,7 +1138,7 @@ for num_layer in num_layer_option:
     all_phase_masks.append(phase_masks)
 
     # 存给matlab用SLM的mask.mat
-    mask_dir = Path("results")
+    mask_dir = Path("results_6modes_eigenmode")
     mask_dir.mkdir(parents=True, exist_ok=True)
     mask_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     mask_mat_path = mask_dir / f"phase_masks_{len(phase_masks)}layers_{mask_tag}.mat"
@@ -1172,7 +1172,7 @@ for num_layer in num_layer_option:
     )
 
     # Qualitative check: label vs prediction heatmaps + amplitude bars
-    diag_dir = Path("results_6modes/prediction_viz") / f"main_L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    diag_dir = Path("results_6modes_eigenmode/prediction_viz") / f"main_L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     diag_paths = save_prediction_diagnostics(
         D2NN,
         test_dataset,
@@ -1215,7 +1215,7 @@ for num_layer in num_layer_option:
 #%% Metrics vs. layer count
 
 if model_metrics:
-    metrics_dir = Path("results_6modes/metrics_analysis")
+    metrics_dir = Path("results_6modes_eigenmode/metrics_analysis")
     metrics_dir.mkdir(parents=True, exist_ok=True)
     metrics_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1308,7 +1308,7 @@ z_start = 0.0
 z_step = 5e-6
 z_prop_plus = z_prop
 
-save_root = Path("results_6modes/mask")
+save_root = Path("results_6modes_eigenmode/mask")
 save_root.mkdir(parents=True, exist_ok=True)
 run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 filename_prefix = f"ODNN_vis_{run_stamp}"
@@ -1374,7 +1374,7 @@ for i_model, phase_masks in phase_mask_entries:
 # #%% 第一层mask做一些位移
 
 # if run_misalignment_robustness and pred_case == 1:
-#     robustness_dir = Path("results_6modes/robustness_analysis")
+#     robustness_dir = Path("results_6modes_eigenmode/robustness_analysis")
 #     robustness_dir.mkdir(parents=True, exist_ok=True)
 #     robustness_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
