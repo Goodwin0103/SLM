@@ -152,9 +152,9 @@ all_cc_recon_phase: list[np.ndarray] = []
 all_training_summaries: list[dict] = []
 
 # SLM
-z_layers   = 49.465e-3        # 原 47.571e-3  -> 40 μm
+z_layers   = 56.251e-3        # 原 47.571e-3  -> 40 μm
 pixel_size = 12.5e-6
-z_prop     = 22e-2        # 原 16.74e-2   -> 60 μm plus 40（最后一层到相机）
+z_prop     = 21e-2        # 原 16.74e-2   -> 60 μm plus 40（最后一层到相机）
 wavelength = 654e-9      # 原 1568     -> 1550 nm
 z_input_to_first = 0 # 40 μm # 新增：输入面到第一层的传播距离
 
