@@ -530,7 +530,7 @@ def compute_amp_relative_error_with_shift(
     """
     model.eval()
     all_weights_pred: list[np.ndarray] = []
-
+    all_weights_raw:  list[np.ndarray] = []   
     with torch.no_grad():
         for images, _ in loader:
             images = images.to(device, dtype=torch.complex64, non_blocking=True)
@@ -883,70 +883,81 @@ def evaluate_spot_metrics(
     mmf_modes: torch.Tensor,
     field_size: int,
     image_test_data: torch.Tensor,
+    snr_ring_inner_pad: int = 3,
+    snr_ring_thickness: int = 8,
+    snr_union_mode: str = "ring",     # "ring" 推荐；或 "global"
 ) -> Dict[str, np.ndarray | float]:
     """
-    Evaluate spot energy ratios and reconstruction metrics for a trained model.
-    Compatible with:
-      - single-wavelength ODNN models
-      - multi-wavelength models (uses wavelength_idx=0 by default)
+    SNR is now computed via spot_energy_and_snr (ring-background estimator),
+    on the cropped intensity Ic of each sample.
     """
     model.eval()
     eps = 1e-12
     r_sig = max(1, int(round(detect_radius / 2.0)))
 
-    snr_ratio_full_list: list[float] = []
-    snr_ratio_crop_list: list[float] = []
+    # ---- bookkeeping ----
     throughput_list: list[float] = []
-    ratio_each_full_batch: list[np.ndarray] = []
+    snr_ratio_full_list: list[float] = []   # 仍然保留旧的占比，用作对照
+    snr_ratio_crop_list: list[float] = []
+
+    snr_union_db_list: list[float] = []     # NEW: 来自 spot_energy_and_snr
+    snr_each_db_batch: list[np.ndarray] = []  # NEW: 每个 ROI 的环形 SNR
 
     all_weights_pred: list[np.ndarray] = []
+    all_weights_raw:  list[np.ndarray] = []
 
     for images, _ in test_loader:
         images = images.to(device, dtype=torch.complex64, non_blocking=True)
 
-        # ✅ MultiWL branch
         if hasattr(model, "propagation") and hasattr(model.propagation, "wavelengths"):
             I_crop_t, I_big_t = forward_full_intensity_multiwl(model, images, wavelength_idx=0)
         else:
             I_crop_t, I_big_t = forward_full_intensity(model, images)
 
-        I_crop = I_crop_t.detach().cpu().numpy()  # (B,1,H,W) or (B,H,W) depending on model
-        I_big = I_big_t.detach().cpu().numpy()    # (B,1,H+2p,W+2p) or (B,H+2p,W+2p)
+        I_crop = I_crop_t.detach().cpu().numpy()
+        I_big  = I_big_t.detach().cpu().numpy()
 
         pad = int(model.propagation.pad_px)
 
-        # Normalize shapes to (B,H,W)
         if I_crop.ndim == 4 and I_crop.shape[1] == 1:
             I_crop = I_crop[:, 0, :, :]
         if I_big.ndim == 4 and I_big.shape[1] == 1:
             I_big = I_big[:, 0, :, :]
 
         for b in range(I_crop.shape[0]):
-            Ic = I_crop[b]  # (H,W)
-            Ib = I_big[b]   # (Hbig,Wbig)
+            Ic = I_crop[b]   # (H, W)
+            Ib = I_big[b]    # (Hbig, Wbig)
 
             total_full = float(Ib.sum())
             total_crop = float(Ic.sum())
 
+            # 旧的占比（保留）
             signal_full = sum_signal_energy_circle(Ib, evaluation_regions, r_sig, offset=(pad, pad))
             signal_crop = sum_signal_energy_circle(Ic, evaluation_regions, r_sig, offset=(0, 0))
-
-            # each region energy ratios on full (2D)
-            _, ratios_full_vec = spot_energy_ratios_circle(Ib, evaluation_regions, r_sig, offset=(pad, pad), eps=eps)
-            ratio_each_full_batch.append(ratios_full_vec)
-
             snr_ratio_full_list.append(signal_full / (total_full + eps))
             snr_ratio_crop_list.append(signal_crop / (total_crop + eps))
             throughput_list.append(total_crop / (total_full + eps))
 
-            # weights from cropped (2D)
+            # ===== NEW: 真正的环形背景 SNR =====
+            snr_info = spot_energy_and_snr(
+                Ic,
+                evaluation_regions,
+                spot_radius=r_sig,
+                ring_inner_pad=snr_ring_inner_pad,
+                ring_thickness=snr_ring_thickness,
+                union_mode=snr_union_mode,
+                center_offset=(0, 0),
+            )
+            snr_union_db_list.append(float(snr_info["snr_union_db"]))
+            snr_each_db_batch.append(np.asarray(snr_info["snr_each_db"], dtype=np.float64))
+
+            # 检测器原始能量（用于 isolation / weights）
             masks_crop = _circle_masks_from_regions(Ic.shape, evaluation_regions, r_sig, offset=(0, 0))
-            weights = np.asarray([float(Ic[m].sum()) for m in masks_crop], dtype=np.float64)
+            weights_raw = np.asarray([float(Ic[m].sum()) for m in masks_crop], dtype=np.float64)
+            all_weights_raw.append(weights_raw)
 
-            norm_val = float(weights.sum())
-            if norm_val > 0:
-                weights = weights / norm_val
-
+            norm_val = float(weights_raw.sum())
+            weights = weights_raw / norm_val if norm_val > 0 else weights_raw
             all_weights_pred.append(weights)
 
     metrics = compute_model_prediction_metrics(
@@ -962,29 +973,82 @@ def evaluate_spot_metrics(
         image_test_data,
     )
 
-    ratio_full = float(np.mean(snr_ratio_full_list)) if snr_ratio_full_list else float("nan")
-    ratio_crop = float(np.mean(snr_ratio_crop_list)) if snr_ratio_crop_list else float("nan")
-    throughput_mean = float(np.mean(throughput_list)) if throughput_list else float("nan")
+    # ---- 聚合 ----
+    ratio_full      = float(np.mean(snr_ratio_full_list)) if snr_ratio_full_list else float("nan")
+    ratio_crop      = float(np.mean(snr_ratio_crop_list)) if snr_ratio_crop_list else float("nan")
+    throughput_mean = float(np.mean(throughput_list))      if throughput_list      else float("nan")
 
-    if ratio_each_full_batch:
-        ratio_each_full_mean_vec = np.mean(np.vstack(ratio_each_full_batch), axis=0)
+    # NEW: 用环形背景 SNR 替换原来的 dB 报表
+    if snr_union_db_list:
+        snr_db_full = float(np.nanmean(snr_union_db_list))
     else:
-        ratio_each_full_mean_vec = np.array([], dtype=np.float64)
+        snr_db_full = float("nan")
 
-    def ratio_to_db(r):
-        r = np.clip(r, eps, 1.0 - eps)
+    if snr_each_db_batch:
+        snr_each_db_mean_vec = np.nanmean(np.vstack(snr_each_db_batch), axis=0)
+    else:
+        snr_each_db_mean_vec = np.array([], dtype=np.float64)
+
+    # ============================================================
+    # Isolation & crosstalk matrix (unchanged)
+    # ============================================================
+    W = np.vstack(all_weights_raw) if all_weights_raw else np.zeros((0, num_modes))
+    isolation_db_per_sample    = np.array([], dtype=np.float64)
+    isolation_db_wc_per_sample = np.array([], dtype=np.float64)
+    crosstalk_matrix           = np.zeros((num_modes, num_modes), dtype=np.float64)
+
+    if W.shape[0] > 0 and W.shape[1] == num_modes:
+        target_amp_full = (amplitudes if phase_option == 4 else amplitudes_phases)[: W.shape[0], :num_modes]
+        target_idx = np.argmax(target_amp_full, axis=1)
+
+        Et          = W[np.arange(W.shape[0]), target_idx]
+        Eothers_sum = W.sum(axis=1) - Et
+        mask_other  = np.ones_like(W, dtype=bool)
+        mask_other[np.arange(W.shape[0]), target_idx] = False
+        Emax_other  = (W * mask_other).max(axis=1)
+
+        isolation_db_per_sample    = 10.0 * np.log10((Et + eps) / (Eothers_sum + eps))
+        isolation_db_wc_per_sample = 10.0 * np.log10((Et + eps) / (Emax_other  + eps))
+
+        W_row_norm = W / (W.sum(axis=1, keepdims=True) + eps)
+        for m in range(num_modes):
+            sel = (target_idx == m)
+            if sel.any():
+                crosstalk_matrix[m] = W_row_norm[sel].mean(axis=0)
+
+    def _ratio_to_db(r):
+        r = float(np.clip(r, eps, 1.0 - eps))
         return 10.0 * np.log10(r / (1.0 - r))
 
-    snr_db_from_ratio_full = ratio_to_db(ratio_full) if np.isfinite(ratio_full) else float("nan")
-    snr_each_db_mean_vec = ratio_to_db(ratio_each_full_mean_vec) if ratio_each_full_mean_vec.size else np.array([])
+    snr_db_containment_full = _ratio_to_db(ratio_full) if np.isfinite(ratio_full) else float("nan")
+    snr_db_containment_crop = _ratio_to_db(ratio_crop) if np.isfinite(ratio_crop) else float("nan")
 
     metrics.update(
         {
+            # 兼容字段（继续输出）
             "snr_ratio_full": ratio_full,
             "snr_ratio_crop": ratio_crop,
-            "throughput": throughput_mean,
-            "snr_db_full": snr_db_from_ratio_full,
-            "snr_each_db": snr_each_db_mean_vec,
+            "throughput":     throughput_mean,
+
+            # ===== 主报表：环形背景 SNR =====
+            "snr_db_ring_union": snr_db_full,           # ring-bg union dB（每样本平均）
+            "snr_each_db":       snr_each_db_mean_vec,  # 每个 ROI 的 ring-bg SNR
+            "snr_union_db_per_sample": np.asarray(snr_union_db_list, dtype=np.float64),
+            "snr_each_db_per_sample":  np.vstack(snr_each_db_batch) if snr_each_db_batch
+                                       else np.zeros((0, len(evaluation_regions))),
+
+            # ===== 旧 containment 也保留 =====
+            "snr_db_containment_full": snr_db_containment_full,    # NEW: r=full(含 pad) 的 containment dB
+            "snr_db_containment_crop": snr_db_containment_crop,    # NEW: r=crop 的 containment dB
+
+            # 兼容旧字段名：让历史代码读 snr_db_full 还能拿到 ring-bg
+            "snr_db_full": snr_db_full,
+
+            "isolation_db":         isolation_db_per_sample,
+            "isolation_db_worst":   isolation_db_wc_per_sample,
+            "isolation_db_mean":    float(np.nanmean(isolation_db_per_sample))    if isolation_db_per_sample.size    else float("nan"),
+            "isolation_db_wc_mean": float(np.nanmean(isolation_db_wc_per_sample)) if isolation_db_wc_per_sample.size else float("nan"),
+            "crosstalk_matrix":     crosstalk_matrix,
         }
     )
 
@@ -1037,6 +1101,17 @@ def format_metric_report(
         ("cc_real", metrics.get("cc_real")),
         ("cc_imag", metrics.get("cc_imag")),
     ]
+
+    snr_db_full = metrics.get("snr_db_full")
+    snr_each_db = metrics.get("snr_each_db")
+    if snr_db_full is not None and not (isinstance(snr_db_full, float) and np.isnan(snr_db_full)):
+        snr_line_parts = [f"snr_union_db={float(snr_db_full):.3f}"]
+        if isinstance(snr_each_db, np.ndarray) and snr_each_db.size:
+            snr_line_parts.append(
+                "snr_each_db=[" + ", ".join(f"{v:.2f}" for v in snr_each_db) + "]"
+            )
+        sections.append("  " + ", ".join(snr_line_parts))
+    
     cc_line = ", ".join(_summary(name, values) for name, values in cc_fields if values is not None)
     if cc_line:
         sections.append("  " + cc_line)

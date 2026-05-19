@@ -150,9 +150,15 @@ all_cc_imag: list[np.ndarray] = []
 all_cc_recon_amp: list[np.ndarray] = []
 all_cc_recon_phase: list[np.ndarray] = []
 all_training_summaries: list[dict] = []
+all_snr_db_full:        list[float] = []
+all_snr_ratio_full:     list[float] = []
+all_throughput:         list[float] = []
+all_isolation_db_mean:  list[float] = []
+all_isolation_db_wc:    list[float] = []
+all_crosstalk_matrices: list[np.ndarray] = []
 
 # SLM
-z_layers   = 56.251e-3        # 原 47.571e-3  -> 40 μm
+z_layers   = 45.744e-3        # 原 47.571e-3  -> 40 μm
 pixel_size = 12.5e-6
 z_prop     = 21e-2        # 原 16.74e-2   -> 60 μm plus 40（最后一层到相机）
 wavelength = 654e-9      # 原 1568     -> 1550 nm
@@ -446,7 +452,7 @@ if pred_case == 1:
     print("Detection Regions:", evaluation_regions)
 
     if show_detection_overlap_debug:
-        detection_debug_dir = Path("results_6modes_eigenmode/detection_region_debug")
+        detection_debug_dir = Path("results_6modes_eigenmode4/detection_region_debug")
         detection_debug_dir.mkdir(parents=True, exist_ok=True)
         if detection_masks is not None:
             overlap_map = np.sum(detection_masks > 0.5, axis=0).astype(np.float32)
@@ -552,7 +558,7 @@ def run_experiment_for_layer_size(
     """
     print(f"\n===== Running experiment for layer_size={layer_size}, num_modes={num_modes} =====")
     viz_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    viz_root = Path("results_6modes_eigenmode/prediction_viz") / f"m{num_modes}_ls{layer_size}_{viz_tag}"
+    viz_root = Path("results_6modes_eigenmode4/prediction_viz") / f"m{num_modes}_ls{layer_size}_{viz_tag}"
     label_size = layer_size
     focus_radius = circle_focus_radius
     detectsize = circle_detectsize
@@ -836,7 +842,7 @@ def run_experiment_for_layer_size(
 
 #%% D2NN models and train them，可以考虑多种layersize的可能
 if run_layer_size_sweep:
-    sweep_dir = Path("results_6modes_eigenmode/layer_size_sweep")
+    sweep_dir = Path("results_6modes_eigenmode4/layer_size_sweep")
     sweep_dir.mkdir(parents=True, exist_ok=True)
     sweep_results = []
     rel_err_matrix = np.full(
@@ -979,7 +985,7 @@ for num_layer in num_layer_option:
         f'(~{total_training_time / 60:.2f} minutes)'
     )
     all_losses.append(losses)  # save the loss for each model
-    training_output_dir = Path("results_6modes_eigenmode/training_analysis")
+    training_output_dir = Path("results_6modes_eigenmode4/training_analysis")
     training_output_dir.mkdir(parents=True, exist_ok=True)
     epochs_array = np.arange(1, epochs + 1, dtype=np.int32)
     cumulative_epoch_times = np.cumsum(epoch_durations)
@@ -1024,7 +1030,7 @@ for num_layer in num_layer_option:
     print(f"✔ Saved cumulative time plot -> {time_plot_path}")
     print(f"✔ Saved training log data (.mat) -> {mat_path}")
 
-    propagation_dir = Path("results_6modes_eigenmode/propagation_slices")
+    propagation_dir = Path("results_6modes_eigenmode4/propagation_slices")
     eigenmode_index = min(2, MMF_data_ts.shape[0] - 1)
     layer_fractions = [build_uniform_fractions(prop_slices_per_segment) for _ in range(num_layer)]
     output_fractions = build_uniform_fractions(prop_output_slices)
@@ -1063,7 +1069,7 @@ for num_layer in num_layer_option:
 
     mode_triptych_records: list[dict[str]] = []
     if evaluation_mode == "eigenmode":
-        triptych_dir = Path("results_6modes_eigenmode/mode_triptychs")
+        triptych_dir = Path("results_6modes_eigenmode4/mode_triptychs")
         mode_tag = f"layers{num_layer}_m{num_modes}_{timestamp_tag}"
         for mode_idx in range(min(num_modes, len(MMF_data_ts))):
             label_tensor = label_data[mode_idx, 0]
@@ -1138,7 +1144,7 @@ for num_layer in num_layer_option:
     all_phase_masks.append(phase_masks)
 
     # 存给matlab用SLM的mask.mat
-    mask_dir = Path("results_6modes_eigenmode")
+    mask_dir = Path("results_6modes_eigenmode4")
     mask_dir.mkdir(parents=True, exist_ok=True)
     mask_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     mask_mat_path = mask_dir / f"phase_masks_{len(phase_masks)}layers_{mask_tag}.mat"
@@ -1158,7 +1164,7 @@ for num_layer in num_layer_option:
         D2NN,
         test_loader,
         evaluation_regions,
-        detect_radius=detectsize,
+        detect_radius=detectsize,  # Use half detectsize for metric evaluation to focus on core region
         device=device,
         pred_case=pred_case,
         num_modes=num_modes,
@@ -1172,7 +1178,7 @@ for num_layer in num_layer_option:
     )
 
     # Qualitative check: label vs prediction heatmaps + amplitude bars
-    diag_dir = Path("results_6modes_eigenmode/prediction_viz") / f"main_L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    diag_dir = Path("results_6modes_eigenmode4/prediction_viz") / f"main_L{num_layer}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     diag_paths = save_prediction_diagnostics(
         D2NN,
         test_dataset,
@@ -1199,6 +1205,13 @@ for num_layer in num_layer_option:
     all_cc_recon_phase.append(metrics.get("cc_recon_phase", np.array([])))
     all_cc_real.append(metrics.get("cc_real", np.array([])))
     all_cc_imag.append(metrics.get("cc_imag", np.array([])))
+    all_snr_db_full.append(float(metrics.get("snr_db_full", float("nan"))))
+    all_snr_ratio_full.append(float(metrics.get("snr_ratio_full", float("nan"))))
+    all_throughput.append(float(metrics.get("throughput", float("nan"))))
+    all_isolation_db_mean.append(float(metrics.get("isolation_db_mean", float("nan"))))
+    all_isolation_db_wc.append(float(metrics.get("isolation_db_wc_mean", float("nan"))))
+    all_crosstalk_matrices.append(np.asarray(metrics.get("crosstalk_matrix", np.zeros((num_modes, num_modes))), dtype=np.float64))
+
     #看看testset的参数值
     print(
         format_metric_report(
@@ -1212,19 +1225,22 @@ for num_layer in num_layer_option:
 
 
 
+
 #%% Metrics vs. layer count
 
 if model_metrics:
-    metrics_dir = Path("results_6modes_eigenmode/metrics_analysis")
+    metrics_dir = Path("results_6modes_eigenmode4/metrics_analysis")
     metrics_dir.mkdir(parents=True, exist_ok=True)
     metrics_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    # ---- 基础数组 ----
     layer_counts = np.asarray(num_layer_option[: len(model_metrics)], dtype=np.int32)
-    amp_err = np.asarray(all_average_amplitudes_diff[: len(layer_counts)], dtype=np.float64)
+    amp_err     = np.asarray(all_average_amplitudes_diff[: len(layer_counts)], dtype=np.float64)
     amp_err_rel = np.asarray(all_amplitudes_relative_diff[: len(layer_counts)], dtype=np.float64)
 
+    # ---- cc_amp 均值/方差 ----
     cc_amp_mean_list: list[float] = []
-    cc_amp_std_list: list[float] = []
+    cc_amp_std_list:  list[float] = []
     for cc_arr in all_cc_recon_amp[: len(layer_counts)]:
         cc_np = np.asarray(cc_arr, dtype=np.float64)
         if cc_np.size:
@@ -1234,9 +1250,21 @@ if model_metrics:
             cc_amp_mean_list.append(float("nan"))
             cc_amp_std_list.append(float("nan"))
     cc_amp_mean = np.asarray(cc_amp_mean_list, dtype=np.float64)
-    cc_amp_std = np.asarray(cc_amp_std_list, dtype=np.float64)
+    cc_amp_std  = np.asarray(cc_amp_std_list,  dtype=np.float64)
 
-    fig, axes = plt.subplots(3, 1, figsize=(7, 9), sharex=True)
+    # ---- 从 model_metrics 提取 SNR / isolation / crosstalk ----
+    snr_db   = np.array([float(m.get("snr_db_full",          float("nan"))) for m in model_metrics[:len(layer_counts)]], dtype=np.float64)
+    snr_full = np.array([float(m.get("snr_ratio_full",       float("nan"))) for m in model_metrics[:len(layer_counts)]], dtype=np.float64)
+    iso_mean = np.array([float(m.get("isolation_db_mean",    float("nan"))) for m in model_metrics[:len(layer_counts)]], dtype=np.float64)
+    iso_wc   = np.array([float(m.get("isolation_db_wc_mean", float("nan"))) for m in model_metrics[:len(layer_counts)]], dtype=np.float64)
+
+    crosstalk_mats = [
+        np.asarray(m.get("crosstalk_matrix", np.zeros((num_modes, num_modes))), dtype=np.float64)
+        for m in model_metrics[: len(layer_counts)]
+    ]
+
+    # ---- 5 行子图（去掉 throughput）----
+    fig, axes = plt.subplots(5, 1, figsize=(7, 14), sharex=True)
 
     axes[0].plot(layer_counts, amp_err, marker="o")
     axes[0].set_ylabel("avg_amp_error")
@@ -1247,17 +1275,25 @@ if model_metrics:
     axes[1].grid(True, alpha=0.3)
 
     axes[2].errorbar(
-        layer_counts,
-        cc_amp_mean,
-        yerr=cc_amp_std,
-        marker="o",
-        color="tab:green",
-        ecolor="tab:green",
-        capsize=4,
+        layer_counts, cc_amp_mean, yerr=cc_amp_std,
+        marker="o", color="tab:green", ecolor="tab:green", capsize=4,
     )
-    axes[2].set_xlabel("Number of layers")
     axes[2].set_ylabel("cc_amp mean ± std")
     axes[2].grid(True, alpha=0.3)
+
+    # SNR 单独一行（不再有 throughput）
+    axes[3].plot(layer_counts, snr_db, marker="o", color="tab:red", label="SNR_full (dB)")
+    axes[3].set_ylabel("SNR_full (dB)")
+    axes[3].grid(True, alpha=0.3)
+    axes[3].legend(loc="best")
+
+    # Isolation
+    axes[4].plot(layer_counts, iso_mean, marker="o", color="tab:purple", label="mean (vs sum)")
+    axes[4].plot(layer_counts, iso_wc,   marker="s", color="tab:brown",  linestyle="--", label="worst-case (vs max)")
+    axes[4].set_xlabel("Number of layers")
+    axes[4].set_ylabel("Isolation (dB)")
+    axes[4].grid(True, alpha=0.3)
+    axes[4].legend(loc="best")
 
     fig.suptitle("Metrics vs. layer count", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
@@ -1266,21 +1302,75 @@ if model_metrics:
     fig.savefig(metrics_plot_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
+    # ---- 保存 .mat（去掉 throughput）----
     metrics_mat_path = metrics_dir / f"metrics_vs_layers_{metrics_tag}.mat"
     savemat(
         str(metrics_mat_path),
         {
-            "layers": layer_counts.astype(np.float64),
-            "avg_amp_error": amp_err,
-            "avg_relative_amp_error": amp_err_rel,
-            "cc_amp_mean": cc_amp_mean,
-            "cc_amp_std": cc_amp_std,
+            "layers":                  layer_counts.astype(np.float64),
+            "avg_amp_error":           amp_err,
+            "avg_relative_amp_error":  amp_err_rel,
+            "cc_amp_mean":             cc_amp_mean,
+            "cc_amp_std":              cc_amp_std,
+            "snr_db_full":             snr_db,
+            "snr_ratio_full":          snr_full,
+            "isolation_db_mean":       iso_mean,
+            "isolation_db_worst":      iso_wc,
+            "crosstalk_matrices":      np.stack(crosstalk_mats, axis=0) if crosstalk_mats else np.zeros((0, num_modes, num_modes)),
         },
     )
 
     print(f"✔ Metrics vs. layers plot saved -> {metrics_plot_path}")
     print(f"✔ Metrics vs. layers data (.mat) -> {metrics_mat_path}")
 
+    # ---- Crosstalk 热力图 ----
+    crosstalk_dir = metrics_dir / "crosstalk_heatmaps"
+    crosstalk_dir.mkdir(parents=True, exist_ok=True)
+
+    for i, (n_layer, M) in enumerate(zip(layer_counts, crosstalk_mats)):
+        M = np.asarray(M, dtype=np.float64)
+        M_db = 10.0 * np.log10(np.clip(M, 1e-6, None))
+
+        fig_ct, axes_ct = plt.subplots(1, 2, figsize=(11, 4.5))
+
+        im0 = axes_ct[0].imshow(M, cmap="viridis", vmin=0, vmax=1)
+        axes_ct[0].set_title(f"Crosstalk (linear) — {n_layer} layers")
+        axes_ct[0].set_xlabel("Detector index")
+        axes_ct[0].set_ylabel("Input mode index")
+        axes_ct[0].set_xticks(range(num_modes)); axes_ct[0].set_yticks(range(num_modes))
+        fig_ct.colorbar(im0, ax=axes_ct[0], fraction=0.046, pad=0.04, label="energy fraction")
+        for r in range(num_modes):
+            for c in range(num_modes):
+                axes_ct[0].text(c, r, f"{M[r, c]:.2f}",
+                                ha="center", va="center",
+                                color=("white" if M[r, c] < 0.5 else "black"),
+                                fontsize=8)
+
+        im1 = axes_ct[1].imshow(M_db, cmap="magma", vmin=-30, vmax=0)
+        axes_ct[1].set_title(f"Crosstalk (dB) — {n_layer} layers")
+        axes_ct[1].set_xlabel("Detector index")
+        axes_ct[1].set_ylabel("Input mode index")
+        axes_ct[1].set_xticks(range(num_modes)); axes_ct[1].set_yticks(range(num_modes))
+        fig_ct.colorbar(im1, ax=axes_ct[1], fraction=0.046, pad=0.04, label="dB")
+        for r in range(num_modes):
+            for c in range(num_modes):
+                axes_ct[1].text(c, r, f"{M_db[r, c]:.0f}",
+                                ha="center", va="center",
+                                color=("white" if M_db[r, c] < -15 else "black"),
+                                fontsize=8)
+
+        iso_m_val = float(iso_mean[i]) if i < len(iso_mean) else float("nan")
+        iso_w_val = float(iso_wc[i])   if i < len(iso_wc)   else float("nan")
+        fig_ct.suptitle(
+            f"{n_layer} layers | mean isolation={iso_m_val:.2f} dB, worst-case={iso_w_val:.2f} dB",
+            fontsize=12,
+        )
+        fig_ct.tight_layout(rect=(0, 0, 1, 0.95))
+
+        ct_out = crosstalk_dir / f"crosstalk_layers{n_layer}_{metrics_tag}.png"
+        fig_ct.savefig(ct_out, dpi=300, bbox_inches="tight")
+        plt.close(fig_ct)
+        print(f"✔ Crosstalk heatmap -> {ct_out}")
 
 
 #%% Propagation slices & mask export，看一个固定的输入的切片输出存个备份mat
@@ -1308,7 +1398,7 @@ z_start = 0.0
 z_step = 5e-6
 z_prop_plus = z_prop
 
-save_root = Path("results_6modes_eigenmode/mask")
+save_root = Path("results_6modes_eigenmode4/mask")
 save_root.mkdir(parents=True, exist_ok=True)
 run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 filename_prefix = f"ODNN_vis_{run_stamp}"
@@ -1374,7 +1464,7 @@ for i_model, phase_masks in phase_mask_entries:
 # #%% 第一层mask做一些位移
 
 # if run_misalignment_robustness and pred_case == 1:
-#     robustness_dir = Path("results_6modes_eigenmode/robustness_analysis")
+#     robustness_dir = Path("results_6modes_eigenmode4/robustness_analysis")
 #     robustness_dir.mkdir(parents=True, exist_ok=True)
 #     robustness_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
